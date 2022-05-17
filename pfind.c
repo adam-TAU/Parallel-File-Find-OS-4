@@ -1,18 +1,3 @@
-
-
-
-#include <stdio.h>
-#include <string.h>
-#include <errno.h>
-#include <stdatomic.h>
-#include <pthreads.h>
-
-
-
-
-
-
-
 /* Submitter: Adam
  * Tel Aviv University
  * Operating Systems, 2022A
@@ -24,29 +9,186 @@
 
 
 
+/****************************** HIGHLIGHTS: TODO ****************************
+	1. If queue is empty, check if all other threads are waiting. If so, terminate everything. 
+	2. Don't busy wait. Use yield_cpu if waiting for dequeue of empty queue.
+	3. Use readdir() to iterate through each dirent directory entry (if "." or ".." ignore). If a directory entry succeeds a opendir()
+	call, then it can be searched and should be added to the queue - in this case if threads are sleeping waiting for work, wake on up.
+	4. If a readdir() catches a dirent which isn't a directory and a file, search for a pattern and if found print the path to it 
+	from the given root directory at the main function. Assume the path is no longer than PATH_MAX.
+	
+	5. If an error occurs in the main thread, print an error to stderr and exit the program with exit code 1.
+	6. If an error occurs in a searching thread, print an error to stderr and exit the thread only.
+	7. The program should exit if all searching thread exited, or if no directories are left to search (all threads waiting).
+	8. Exit code should be 0 if and only if no thread has encountered an error
+	9. Print: "Done searching, found %d files\n", only before exiting (right before).
+	10. No need to free resources
+	11. No need to check for errors in calls to mtx_* or cnd* functions
+	12. no deadlocks
+	13. The first to sleep, the one to get the first directory in the queue
+	14. The thread should sleep only if the queue was empty upon arrival 
+****************************** HIGHLIGHTS: TODO ****************************/
+
+
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <stdatomic.h>
+#include <pthread.h>
+#include <limits.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+
+#define bool int
+#define false 0
+#define true 1
+#define file_t 2
+#define dir_t 3
+
+
+/****************************** STRUCTS ****************************/
+typedef struct queue_entry_t {
+	char* path;
+	DIR *dir;
+	struct queue_entry_t *next;
+} queue_entry_t;
+
+typedef struct queue_t {
+	queue_entry_t head;
+	unsigned int count;
+} queue_t;
+/*******************************************************************/
+
+
+
+
+
+/****************************** GLOBAL VARS ****************************/
+static queue_t dir_queue = {0};
+static atomic_uint pattern_matches = 0;
+/***********************************************************************/
+
+
+
 
 
 /****************************** AUXILIARY FUNCTIONS DECLARATIONS ****************************/
-void print_err(char* error_message, bool terminate);
+/* Handle an error, print the corresponding error message, and terminate if needed */
+void print_err(char* error_message, bool thrd_exit, bool terminate);
+
+/* A function dedicated to be ran by the auxiliar threads. This function fetches a directory
+ * from the aforesaid queue and enumerates it for files who hold the pattern we're search for */ 
+void *thrd_reap_directories(void* pattern);
+
+/* A function dedicated to be ran by an auxiliary thread. This function accepts a directory,
+ * enumerates it, prints pattern-matched files in the directory, and potentially enters new 
+ * directory queue entries into the waiting directory queue. 
+ 
+ * On success, returns 0. */
+int dir_enum(DIR *dir, char path[], char pattern[]);
+
+/* A function dedicated to handle a new directory that has been fonud in the root directory
+ * search tree.
+  
+ * On success, returns 0. */
+int handle_new_dir(char path[]);
+
+/* A function dedicated to handle a new file that has been fonud in the root directory
+ * search tree.
+  
+ * On success, returns 0. */
+void handle_new_file(char filename[], char path[], char pattern[]);
+
+/* A function dedicated to append the name of a dirent to the current path of its directory. 
+
+ * On success, returns 0. */
+void append_path(char path[], char dirent_name[], char new_path[]);
+
+/* A function dedicated to be ran by an auxiliary thread. This function accepts a string (the 
+ * directory name in our case), and enqueues it atomically into the given queue. 
+  
+ * On success, returns 0. */
+int enqueue(queue_t queue, queue_entry_t *entry);
+
+/* A function dedicated to be ran by an auxiliary thread. This function accepts a string (the 
+ * directory name in our case), and atomically dequeues the first entry of the given queue 
+ * into the string. 
+  
+ * On success, returns 0. */
+int dequeue(queue_t queue, queue_entry_t *entry);
 /*******************************************************************************************/
-
-
-
-
 
 
 
 
 
 /****************************** AUXILIARY FUNCTIONS DEFINITIONS ****************************/
+int dir_enum(DIR *dir, char path[], char pattern[]) {
+	struct dirent *entry;
 
+	while ( NULL != (entry = readdir(dir)) ) {
+		/* Eliminating recurssive dir entries */
+		if ( (strcmp(entry->d_name, ".") == 0) || (strcmp(entry->d_name, "..") == 0) ) continue;
+		
+		/* Joining the path */
+		char entry_path[PATH_MAX];
+		append_path(path, entry->d_name, entry_path);
+		
+		/* Getting the file type of the dirent */
+		struct stat entry_statbuf;
+		if (0 != stat(entry_path, &entry_statbuf)) {
+			print_err("Error with using the `stat` command on dirent", false, false);
+			return -1;
+		}
+		
+		/* If the entry points to a directory */
+		if (S_ISDIR(entry_statbuf.st_mode)) {
+			if (0 < handle_new_dir(entry_path)) return -1;
+			continue;
+		}
+		
+		/* If the entry points to a file */
+		else if (S_ISREG(entry_statbuf.st_mode)) {
+			handle_new_file(entry->d_name, entry_path, pattern);
+			continue;
+		}
+	}
+	
+	return 0;
+}
+
+int handle_new_dir(char path[]) {
+	queue_entry_t new_dir;
+
+	if ( NULL == (new_dir.dir = opendir(path)) ) { // if an error occurred
+	
+		if (errno != EACCES) { // errors other than no permissions are treated as errors
+			print_err("Error with using the `opendir` command on a new found directory", false, false);
+			return -1; 
+		} else { // simple permissions denial stdout message
+			printf("Directory %s: Permission denied.\n", path); 
+		}
+		
+	} else { // if opendir succeeded, we must have enough permissions to search the directory, so we enqueue it
+		new_dir.path = path;
+		if (0 < enqueue(dir_queue, &new_dir)) return -1;
+	}
+	
+	return 0;
+}
+
+void handle_new_file(char filename[], char path[], char pattern[]) {
+	if (NULL != strstr(filename, pattern)) {
+		pattern_matches++;
+		printf("%s\n", path);
+	}
+}
+
+void append_path(char path[], char dirent_name[], char new_path[]) {
+	sprintf(new_path, "%s/%s", path, dirent_name);
+}
 /*******************************************************************************************/
-
-
-
-
-
-
 
 
 
@@ -57,7 +199,7 @@ int main(int args, char* argv[]) {
 	
 	// checking for the correct amount of arguments
 	if (args != 3) {
-		print_err("Not enough arguments!", true);
+		print_err("Not enough arguments!", false, true);
 	}
 	
 	// fetching data
