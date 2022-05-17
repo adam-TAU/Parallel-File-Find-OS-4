@@ -107,7 +107,7 @@ void handle_new_file(char filename[], char path[], char pattern[]);
  
  * Doesn't synchronize anything (allows for termination upon finding an error)
  * On success, returns 0. */
-void append_path(char path[], char dirent_name[], char new_path[]);
+void append_path(char path[], char dirent_name[], char** new_path);
 
 /* A function dedicated to be ran by an auxiliary thread. This function accepts a string (the 
  * directory name in our case), and enqueues it atomically into the given queue. 
@@ -134,7 +134,7 @@ void print_err(char* error_message, bool thrd_exit) {
 	errno = tmp_errno;
 	
 	if (thrd_exit) {
-		pthread_exit(1);
+		pthread_exit(NULL);
 	}
 }
 
@@ -143,7 +143,7 @@ void *thrd_reap_directories(void* pattern) {
 	
 	while (true) {
 		dequeue(dir_queue, &curr_dir_entry); // thread-safe
-		dir_enum(curr_dir_entry.dir, curr_dir_entry.path, (char*) pattern)); // thread-safe
+		dir_enum(curr_dir_entry.dir, curr_dir_entry.path, (char*) pattern); // thread-safe
 	}
 }
 
@@ -155,8 +155,8 @@ int dir_enum(DIR *dir, char path[], char pattern[]) {
 		if ( (strcmp(entry->d_name, ".") == 0) || (strcmp(entry->d_name, "..") == 0) ) continue;
 		
 		/* Joining the path */
-		char entry_path[PATH_MAX]; // perhaps allocate it dynamically with the <path> length and <entry->d_name> length
-		append_path(path, entry->d_name, entry_path);
+		char* entry_path;
+		append_path(path, entry->d_name, &entry_path);
 		
 		/* Getting the file type of the dirent */
 		struct stat entry_statbuf;
@@ -208,25 +208,38 @@ void handle_new_file(char filename[], char path[], char pattern[]) {
 	}
 }
 
-void append_path(char path[], char dirent_name[], char new_path[]) {
-	sprintf(new_path, "%s/%s", path, dirent_name);
+void append_path(char path[], char dirent_name[], char** new_path) {
+	*new_path = (char*) malloc( sizeof(char) * (strlen(path) + strlen(dirent_name) + 1) );
+	sprintf(*new_path, "%s/%s", path, dirent_name);
 }
 
 int enqueue(queue_t queue, queue_entry_t *entry) {
+	int status = 0;
+	
+	/* Synchronization block start (can't terminate upon error, must engolf with status var */
 	pthread_mutex_lock(&queue_lock);
 	/* Add entry to queue */
 	pthread_cond_signal(&queue_not_empty);
 	pthread_mutex_unlock(&queue_lock);
+	/* Synchronization block end */
+	
+	return status;
 	
 }
 
 int dequeue(queue_t queue, queue_entry_t *entry) {
+	int status = 0;
+
+	/* Synchronization block start (can't terminate upon error, must engolf with status var */
 	pthread_mutex_lock(&queue_lock);
 	while (true) {
 		pthread_cond_wait(&queue_not_empty, &queue_lock);
 	}
 	/* remove entry from queue into given entry pointer */
 	pthread_mutex_unlock(&queue_lock);
+	/* Synchronization block end */
+	
+	return status;
 }
 /*******************************************************************************************/
 
@@ -239,7 +252,7 @@ int main(int args, char* argv[]) {
 	
 	// checking for the correct amount of arguments
 	if (args != 3) {
-		print_err("Not enough arguments!", false, true);
+		print_err("Not enough arguments!", true); // verify correpondentness to instructions
 	}
 	
 	// fetching data
