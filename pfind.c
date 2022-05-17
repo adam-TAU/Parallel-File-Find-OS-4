@@ -14,7 +14,6 @@
 	2. Don't busy wait. Use yield_cpu if waiting for dequeue of empty queue.
 	3. Use readdir() to iterate through each dirent directory entry (if "." or ".." ignore). If a directory entry succeeds a opendir()
 	call, then it can be searched and should be added to the queue - in this case if threads are sleeping waiting for work, wake on up.
-	4. If a readdir() catches a dirent which isn't a directory and a file, search for a pattern and if found print the path to it 
 	from the given root directory at the main function. Assume the path is no longer than PATH_MAX.
 	
 	5. If an error occurs in the main thread, print an error to stderr and exit the program with exit code 1.
@@ -43,8 +42,6 @@
 #define bool int
 #define false 0
 #define true 1
-#define file_t 2
-#define dir_t 3
 
 
 /****************************** STRUCTS ****************************/
@@ -67,6 +64,8 @@ typedef struct queue_t {
 /****************************** GLOBAL VARS ****************************/
 static queue_t dir_queue = {0};
 static atomic_uint pattern_matches = 0;
+static pthread_mutex_t queue_lock;
+static pthread_cond_t queue_not_empty;
 /***********************************************************************/
 
 
@@ -74,8 +73,9 @@ static atomic_uint pattern_matches = 0;
 
 
 /****************************** AUXILIARY FUNCTIONS DECLARATIONS ****************************/
-/* Handle an error, print the corresponding error message, and terminate if needed */
-void print_err(char* error_message, bool thrd_exit, bool terminate);
+/* Handle an error, print the corresponding error message, and terminate if needed. Thread-safe
+ * since `perror` is thread-safe. */
+void print_err(char* error_message, bool thrd_exit);
 
 /* A function dedicated to be ran by the auxiliar threads. This function fetches a directory
  * from the aforesaid queue and enumerates it for files who hold the pattern we're search for */ 
@@ -84,24 +84,28 @@ void *thrd_reap_directories(void* pattern);
 /* A function dedicated to be ran by an auxiliary thread. This function accepts a directory,
  * enumerates it, prints pattern-matched files in the directory, and potentially enters new 
  * directory queue entries into the waiting directory queue. 
- 
+
+ * Doesn't synchronize anything (allows for termination upon finding an error)
  * On success, returns 0. */
 int dir_enum(DIR *dir, char path[], char pattern[]);
 
 /* A function dedicated to handle a new directory that has been fonud in the root directory
  * search tree.
   
+ * Doesn't synchronize anything (allows for termination upon finding an error)
  * On success, returns 0. */
 int handle_new_dir(char path[]);
 
 /* A function dedicated to handle a new file that has been fonud in the root directory
  * search tree.
   
+ * Doesn't synchronize anything (allows for termination upon finding an error)
  * On success, returns 0. */
 void handle_new_file(char filename[], char path[], char pattern[]);
 
 /* A function dedicated to append the name of a dirent to the current path of its directory. 
-
+ 
+ * Doesn't synchronize anything (allows for termination upon finding an error)
  * On success, returns 0. */
 void append_path(char path[], char dirent_name[], char new_path[]);
 
@@ -124,6 +128,25 @@ int dequeue(queue_t queue, queue_entry_t *entry);
 
 
 /****************************** AUXILIARY FUNCTIONS DEFINITIONS ****************************/
+void print_err(char* error_message, bool thrd_exit) {
+	int tmp_errno = errno;
+	perror(error_message); // this basically prints error_message, with <strerror(errno)> appended to it */
+	errno = tmp_errno;
+	
+	if (thrd_exit) {
+		pthread_exit(1);
+	}
+}
+
+void *thrd_reap_directories(void* pattern) {
+	queue_entry_t curr_dir_entry;
+	
+	while (true) {
+		dequeue(dir_queue, &curr_dir_entry); // thread-safe
+		dir_enum(curr_dir_entry.dir, curr_dir_entry.path, (char*) pattern)); // thread-safe
+	}
+}
+
 int dir_enum(DIR *dir, char path[], char pattern[]) {
 	struct dirent *entry;
 
@@ -132,13 +155,13 @@ int dir_enum(DIR *dir, char path[], char pattern[]) {
 		if ( (strcmp(entry->d_name, ".") == 0) || (strcmp(entry->d_name, "..") == 0) ) continue;
 		
 		/* Joining the path */
-		char entry_path[PATH_MAX];
+		char entry_path[PATH_MAX]; // perhaps allocate it dynamically with the <path> length and <entry->d_name> length
 		append_path(path, entry->d_name, entry_path);
 		
 		/* Getting the file type of the dirent */
 		struct stat entry_statbuf;
 		if (0 != stat(entry_path, &entry_statbuf)) {
-			print_err("Error with using the `stat` command on dirent", false, false);
+			print_err("Error `stat`-ing a dirent", true);
 			return -1;
 		}
 		
@@ -164,7 +187,7 @@ int handle_new_dir(char path[]) {
 	if ( NULL == (new_dir.dir = opendir(path)) ) { // if an error occurred
 	
 		if (errno != EACCES) { // errors other than no permissions are treated as errors
-			print_err("Error with using the `opendir` command on a new found directory", false, false);
+			print_err("Error with using the `opendir` command on a new found directory", true);
 			return -1; 
 		} else { // simple permissions denial stdout message
 			printf("Directory %s: Permission denied.\n", path); 
@@ -172,7 +195,7 @@ int handle_new_dir(char path[]) {
 		
 	} else { // if opendir succeeded, we must have enough permissions to search the directory, so we enqueue it
 		new_dir.path = path;
-		if (0 < enqueue(dir_queue, &new_dir)) return -1;
+		enqueue(dir_queue, &new_dir);
 	}
 	
 	return 0;
@@ -187,6 +210,23 @@ void handle_new_file(char filename[], char path[], char pattern[]) {
 
 void append_path(char path[], char dirent_name[], char new_path[]) {
 	sprintf(new_path, "%s/%s", path, dirent_name);
+}
+
+int enqueue(queue_t queue, queue_entry_t *entry) {
+	pthread_mutex_lock(&queue_lock);
+	/* Add entry to queue */
+	pthread_cond_signal(&queue_not_empty);
+	pthread_mutex_unlock(&queue_lock);
+	
+}
+
+int dequeue(queue_t queue, queue_entry_t *entry) {
+	pthread_mutex_lock(&queue_lock);
+	while (true) {
+		pthread_cond_wait(&queue_not_empty, &queue_lock);
+	}
+	/* remove entry from queue into given entry pointer */
+	pthread_mutex_unlock(&queue_lock);
 }
 /*******************************************************************************************/
 
