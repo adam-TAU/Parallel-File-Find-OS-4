@@ -34,6 +34,7 @@
 typedef struct queue_entry_t {
 	char* path;
 	DIR *dir;
+	pthread_cond_t queue_not_empty;
 	struct queue_entry_t *next;
 } queue_entry_t;
 
@@ -49,15 +50,14 @@ typedef struct queue_t {
 
 /****************************** GLOBAL VARS ****************************/
 static queue_t dir_queue = {0};
+static queue_t threads_cv_queue = {0};
 static atomic_uint num_threads = 0; // the number of threads that were desired to be launched
 static atomic_uint pattern_matches = 0; // the number of files that have been found to contain the pattern
-static atomic_uint waiting_threads = 0; // the number of threads that are currently waiting for tasks
 static atomic_uint running_threads = 0; // the number of threads that haven't encountered an error
 static atomic_int threads_started = false; // used as an indication for if the <threads_start> condition has already met
 static atomic_int threads_finished = false; // used as an indication for if all of the threads finished their work (i.e., all threads are waiting)
-static pthread_rwlock_t shared_objects_rw_lock; // single-writer multiple readers lock for all shared objects
-static pthread_mutex_t queue_lock; // mutual excluder for queue operations (should find a better use than that)
-static pthread_cond_t queue_not_empty; // condition for a non-empty queue
+static pthread_rwlock_t shared_objects_rw_lock; // single-writer multiple readers lock for all shared objects (specifically running_threads)
+static pthread_mutex_t queue_lock; // mutual excluder for queue operations
 static pthread_mutex_t all_threads_created_event_lock; // a lock for bounding the thread creation condition-variable use
 static pthread_cond_t all_threads_created_event; // condition for identifying a thread creation
 static pthread_mutex_t threads_start_event_lock; // a lock for the following condition variable
@@ -79,6 +79,10 @@ void print_err(char* error_message, bool thrd_exit, bool program_exit);
  * Doesn't synchronize anything (allows for termination upon finding an error)
  * On success, returns 0. */
 int atomic_create_threads(unsigned int num_threads, pthread_t* thread_ids, char pattern[]);
+
+/* Used to release all waiting threads from their waiting-process. This must be used only upon
+ * finishing all work distributed among the threads */
+void release_all_threads(void);
 
 /* A function dedicated to be ran by the auxiliar threads. This function fetches a directory
  * from the aforesaid queue and enumerates it for files who hold the pattern we're search for */ 
@@ -120,12 +124,12 @@ void dequeue(queue_t *queue, queue_entry_t **entry);
 
 /* A function dedicated to be ran by an auxiliary thread. This function accepts a string (the 
  * directory name in our case), and enqueues it synchronously into the given queue. */
-void sync_enqueue(queue_t *queue, queue_entry_t *entry);
+void sync_enqueue(queue_entry_t *entry);
 
 /* A function dedicated to be ran by an auxiliary thread. This function accepts a string (the 
  * directory name in our case), and synchronously dequeues the first entry of the given queue 
  * into the string. */
-void sync_dequeue(queue_t *queue, queue_entry_t **entry);
+void sync_dequeue(queue_entry_t **entry);
 
 /* Checks if all searching threads that are alive are waiting for tasks.
  * If so, the program shall finish due to no work left, therefore this function
@@ -144,10 +148,9 @@ void print_err(char* error_message, bool thrd_exit, bool program_exit) {
 	errno = tmp_errno;
 	
 	if (thrd_exit) {
-		pthread_rwlock_rdlock(&shared_objects_rw_lock); // engulfing write with wr lock
-		waiting_threads--;
+		pthread_rwlock_wrlock(&shared_objects_rw_lock);
 		running_threads--;
-		pthread_rwlock_unlock(&shared_objects_rw_lock); // degulfing write with wr lock
+		pthread_rwlock_unlock(&shared_objects_rw_lock);
 		pthread_exit(NULL); // exiting the thread
 	}
 	
@@ -176,6 +179,14 @@ int atomic_create_threads(unsigned int num_threads, pthread_t* thread_ids, char 
 	return 0;
 }
 
+void release_all_threads(void) {
+	queue_entry_t* curr;
+	
+	while ( NULL != (curr = threads_cv_queue.head) ) {
+		pthread_cond_signal(&curr->queue_not_empty);
+	}
+}
+
 void *thrd_reap_directories(void* pattern) {
 	queue_entry_t *curr_dir_entry;
 
@@ -196,7 +207,7 @@ void *thrd_reap_directories(void* pattern) {
 	
 	/* Start searching */
 	while (true) {
-		sync_dequeue(&dir_queue, &curr_dir_entry); // thread-safe
+		sync_dequeue(&curr_dir_entry); // thread-safe
 		if (NULL != curr_dir_entry) { // sometimes sync_dequeue will dequeue an empty queue for the sake of making all threads exit
 			dir_enum(curr_dir_entry->dir, curr_dir_entry->path, (char*) pattern); // thread-safe
 		} else {
@@ -214,19 +225,20 @@ void *thrd_reap_directories(void* pattern) {
 		pthread_mutex_lock(&queue_lock);
 		if (threads_finished) { // if a thread has already indicated to everyone that the work is done
 			pthread_mutex_unlock(&queue_lock);
-			pthread_exit(NULL); 
+			break;
 		}
 		if (is_finished()) { // if no thread has indicated that the work is done
 			printf("broadcast\n");
 			threads_finished = true;
-			pthread_cond_broadcast(&queue_not_empty); // deceiving waiting threads to continue to this block of code
+			release_all_threads();
 			pthread_mutex_unlock(&queue_lock);
-			pthread_exit(NULL); 
+			break;
 		}
 		
 		pthread_mutex_unlock(&queue_lock);
 	}
-	pthread_exit(NULL);
+	
+	pthread_exit(NULL); 
 }
 
 void dir_enum(DIR *dir, char path[], char pattern[]) {
@@ -277,7 +289,7 @@ void handle_new_dir(char path[]) {
 		}
 		
 	} else { // if opendir succeeded, we must have enough permissions to search the directory, so we enqueue it
-		sync_enqueue(&dir_queue, new_dir);
+		sync_enqueue(new_dir);
 	}
 }
 
@@ -313,31 +325,42 @@ void dequeue(queue_t *queue, queue_entry_t **entry) {
 }
 
 
-void sync_enqueue(queue_t *queue, queue_entry_t *entry) {
+void sync_enqueue(queue_entry_t *entry) {
+	queue_entry_t *thread_cv_entry;
 	
 	/* Synchronization block start (can't terminate upon error, must engolf with status var */
 	pthread_mutex_lock(&queue_lock);
 	
 	/* Add entry to queue */
-	enqueue(queue, entry);
+	enqueue(&dir_queue, entry);
 	
-	pthread_cond_signal(&queue_not_empty);
+	/* dequeue the condition variable of the first thread who went to sleep */
+	dequeue(&threads_cv_queue, &thread_cv_entry);
+	
+	/* Signal the first thread who went to sleep to start working */
+	if (NULL != thread_cv_entry) { // if no threads are waiting, then there's no need signal anyone
+		pthread_cond_signal(&thread_cv_entry->queue_not_empty);
+	}
+	
 	pthread_mutex_unlock(&queue_lock);
 	/* Synchronization block end */
 }
 
-void sync_dequeue(queue_t *queue, queue_entry_t **entry) {
+void sync_dequeue(queue_entry_t **entry) {
+	queue_entry_t thread_cv_entry;
 
-	/* Synchronization block start (can't terminate upon error, must engolf with status var */
+	/* Synchronization block start */
 	pthread_mutex_lock(&queue_lock);
-	waiting_threads++;
-	while (queue->size == 0) {
-		pthread_cond_wait(&queue_not_empty, &queue_lock);
+	
+	/* Add the condition variable of this thread to the queue */
+	enqueue(&threads_cv_queue, &thread_cv_entry);
+	
+	while (dir_queue.size == 0) {
+		pthread_cond_wait(&thread_cv_entry.queue_not_empty, &queue_lock);
 	}
-	waiting_threads--;
 	
 	/* remove entry from queue into given entry pointer */
-	dequeue(queue, entry);
+	dequeue(&dir_queue, entry);
 	
 	pthread_mutex_unlock(&queue_lock);
 	/* Synchronization block end */
@@ -348,7 +371,7 @@ bool is_finished(void) {
 
 	/* Safely read the amount of running threads and the amount of waiting threads */
 	pthread_rwlock_rdlock(&shared_objects_rw_lock);
-	ret = (waiting_threads == running_threads - 1) && (dir_queue.size == 0); // all other threads are waiting and queue is empty (must be called after finishing the own work of the thread)
+	ret = (threads_cv_queue.size == running_threads - 1) && (dir_queue.size == 0); // all other threads are waiting and queue is empty (must be called after finishing the own work of the thread)
 	pthread_rwlock_unlock(&shared_objects_rw_lock);
 	
 	/* Return value */

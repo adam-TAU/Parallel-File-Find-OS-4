@@ -1,3 +1,7 @@
 a.out
 tester_sid/a.out
 tester_sid/pfind.c
+tester_sid/sid_source/*
+tester_sid/test-debug.log
+tester_sid/test_filesystem/
+tester_sid/pfind
