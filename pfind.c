@@ -247,6 +247,9 @@ void dir_enum(DIR *dir, char path[], char pattern[]) {
 			continue;
 		}
 	}	
+	
+	// close the open dirent after use to free up the fd table
+	if (0 != closedir(dir)) print_err("Error with closing the open directory", true, false);
 }
 
 void handle_new_dir(char path[]) {
@@ -374,7 +377,9 @@ int main(int args, char* argv[]) {
 	root_dir = malloc(sizeof(queue_entry_t));
 	root_dir->path = root_dir_path;
 	root_dir->next = NULL;
-	if ( NULL == (root_dir->dir = opendir(root_dir->path)) ) exit(1);
+	if ( NULL == (root_dir->dir = opendir(root_dir->path)) ) {
+		print_err("Error with opening the root directory", false, true);
+	}
 	enqueue(&dir_queue, root_dir);
 	
 	// create all threads and wait for all of them to be created
