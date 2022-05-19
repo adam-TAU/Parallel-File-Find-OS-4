@@ -11,7 +11,6 @@
 
 /****************************** HIGHLIGHTS: TODO ****************************
 	7. The program should exit if all searching thread exited, or if no directories are left to search (all threads waiting).
-	12. no deadlocks
 ****************************** HIGHLIGHTS: TODO ****************************/
 
 
@@ -34,7 +33,7 @@
 typedef struct queue_entry_t {
 	char* path;
 	DIR *dir;
-	pthread_cond_t queue_not_empty;
+	pthread_cond_t queue_not_empty_event;
 	struct queue_entry_t *next;
 } queue_entry_t;
 
@@ -50,7 +49,7 @@ typedef struct queue_t {
 
 /****************************** GLOBAL VARS ****************************/
 static queue_t dir_queue = {0};
-static queue_t threads_cv_queue = {0};
+static queue_t waiting_threads_queue = {0};
 static atomic_uint num_threads = 0; // the number of threads that were desired to be launched
 static atomic_uint pattern_matches = 0; // the number of files that have been found to contain the pattern
 static atomic_uint running_threads = 0; // the number of threads that haven't encountered an error
@@ -72,6 +71,12 @@ static pthread_cond_t threads_start_event; // condition for identifying if searc
 /* Handle an error, print the corresponding error message, and terminate if needed. Thread-safe
  * since `perror` is thread-safe. */
 void print_err(char* error_message, bool thrd_exit, bool program_exit);
+
+/* Initializes global condition variables and locks */
+void init_peripherals(void);
+
+/* Destroys global condition variables and locks */
+void destroy_peripherals(void);
 
 /* Accepts a number of desired threads, and tries to create them while saving their thread-ids
  * into the given array of <pthread_t>-s.
@@ -129,7 +134,7 @@ void sync_enqueue(queue_entry_t *entry);
 /* A function dedicated to be ran by an auxiliary thread. This function accepts a string (the 
  * directory name in our case), and synchronously dequeues the first entry of the given queue 
  * into the string. */
-void sync_dequeue(queue_entry_t **entry);
+void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry);
 
 /* Checks if all searching threads that are alive are waiting for tasks.
  * If so, the program shall finish due to no work left, therefore this function
@@ -159,6 +164,24 @@ void print_err(char* error_message, bool thrd_exit, bool program_exit) {
 	}
 }
 
+void init_peripherals(void) {
+	pthread_rwlock_init(&shared_objects_rw_lock, NULL);
+	pthread_mutex_init(&queue_lock, NULL);
+	pthread_mutex_init(&all_threads_created_event_lock, NULL);
+	pthread_mutex_init(&threads_start_event_lock, NULL);
+	pthread_cond_init(&all_threads_created_event, NULL);
+	pthread_cond_init(&threads_start_event, NULL);
+}
+
+void destroy_peripherals(void) {
+	pthread_rwlock_destroy(&shared_objects_rw_lock);
+	pthread_mutex_destroy(&queue_lock);
+	pthread_mutex_destroy(&all_threads_created_event_lock);
+	pthread_mutex_destroy(&threads_start_event_lock);
+	pthread_cond_destroy(&all_threads_created_event);
+	pthread_cond_destroy(&threads_start_event);
+}
+
 int atomic_create_threads(unsigned int num_threads, pthread_t* thread_ids, char pattern[]) {
 	unsigned int i;
 	
@@ -180,16 +203,21 @@ int atomic_create_threads(unsigned int num_threads, pthread_t* thread_ids, char 
 }
 
 void release_all_threads(void) {
-	queue_entry_t* curr;
+	queue_entry_t* curr = waiting_threads_queue.head;
 	
-	while ( NULL != (curr = threads_cv_queue.head) ) {
-		pthread_cond_signal(&curr->queue_not_empty);
+	while (NULL != curr) {
+		pthread_cond_signal(&curr->queue_not_empty_event);
+		curr = curr->next;
 	}
 }
 
 void *thrd_reap_directories(void* pattern) {
 	queue_entry_t *curr_dir_entry;
-
+	
+	// creating a dedicated condition variable for this thread to use to be woken up for work with
+	queue_entry_t thread_cv_entry;
+	pthread_cond_init(&thread_cv_entry.queue_not_empty_event, NULL);
+	
 	/* Signal the main thread about the thread creation */\
 	pthread_mutex_lock(&all_threads_created_event_lock);
 	running_threads++;
@@ -207,8 +235,8 @@ void *thrd_reap_directories(void* pattern) {
 	
 	/* Start searching */
 	while (true) {
-		sync_dequeue(&curr_dir_entry); // thread-safe
-		if (NULL != curr_dir_entry) { // sometimes sync_dequeue will dequeue an empty queue for the sake of making all threads exit
+		sync_dequeue(&curr_dir_entry, &thread_cv_entry); // thread-safe
+		if (NULL != curr_dir_entry) { // sometimes sync_dequeue will dequeue an empty queue for the sake of exiting
 			dir_enum(curr_dir_entry->dir, curr_dir_entry->path, (char*) pattern); // thread-safe
 		} else {
 			printf("%d\n", threads_finished);
@@ -228,16 +256,15 @@ void *thrd_reap_directories(void* pattern) {
 			break;
 		}
 		if (is_finished()) { // if no thread has indicated that the work is done
-			printf("broadcast\n");
 			threads_finished = true;
 			release_all_threads();
 			pthread_mutex_unlock(&queue_lock);
 			break;
 		}
-		
 		pthread_mutex_unlock(&queue_lock);
 	}
 	
+	pthread_cond_destroy(&thread_cv_entry.queue_not_empty_event);
 	pthread_exit(NULL); 
 }
 
@@ -255,7 +282,7 @@ void dir_enum(DIR *dir, char path[], char pattern[]) {
 		
 		/* Getting the file type of the dirent */
 		if (0 != lstat(entry_path, &entry_statbuf)) {
-			print_err("Error wiht `stat`-ing a dirent", true, false);
+			print_err("Error with `stat`-ing a dirent", true, false);
 		}
 		
 		/* If the entry points to a directory */
@@ -317,7 +344,7 @@ void enqueue(queue_t *queue, queue_entry_t *entry) {
 void dequeue(queue_t *queue, queue_entry_t **entry) {
 	if (queue->size == 0) {
 		*entry = NULL;
-	} else {
+	} else if (entry != NULL) {
 		*entry = queue->head;
 		queue->head = queue->head->next;
 		queue->size--;
@@ -325,41 +352,42 @@ void dequeue(queue_t *queue, queue_entry_t **entry) {
 }
 
 
-void sync_enqueue(queue_entry_t *entry) {
+void sync_enqueue(queue_entry_t *dir_queue_entry) {
 	queue_entry_t *thread_cv_entry;
 	
-	/* Synchronization block start (can't terminate upon error, must engolf with status var */
+	/* Synchronization block start (can't terminate upWon error, must engolf with status var */
 	pthread_mutex_lock(&queue_lock);
 	
-	/* Add entry to queue */
-	enqueue(&dir_queue, entry);
+	/* Add directory entry to queue */
+	enqueue(&dir_queue, dir_queue_entry);
 	
 	/* dequeue the condition variable of the first thread who went to sleep */
-	dequeue(&threads_cv_queue, &thread_cv_entry);
+	dequeue(&waiting_threads_queue, &thread_cv_entry);
 	
-	/* Signal the first thread who went to sleep to start working */
+	/* Signal the first thread who went to sleep first to start working */
 	if (NULL != thread_cv_entry) { // if no threads are waiting, then there's no need signal anyone
-		pthread_cond_signal(&thread_cv_entry->queue_not_empty);
+		pthread_cond_signal(&thread_cv_entry->queue_not_empty_event);
 	}
 	
 	pthread_mutex_unlock(&queue_lock);
 	/* Synchronization block end */
 }
 
-void sync_dequeue(queue_entry_t **entry) {
-	queue_entry_t thread_cv_entry;
-
+void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
+	
 	/* Synchronization block start */
 	pthread_mutex_lock(&queue_lock);
 	
 	/* Add the condition variable of this thread to the queue */
-	enqueue(&threads_cv_queue, &thread_cv_entry);
-	
-	while (dir_queue.size == 0) {
-		pthread_cond_wait(&thread_cv_entry.queue_not_empty, &queue_lock);
+	if (dir_queue.size == 0) {
+		enqueue(&waiting_threads_queue, thread_cv_entry);
+		while (dir_queue.size == 0 && !threads_finished) {
+			pthread_cond_wait(&thread_cv_entry->queue_not_empty_event, &queue_lock);
+			printf("nothing\n");
+		}
 	}
 	
-	/* remove entry from queue into given entry pointer */
+	/* remove directory entry from queue into given entry pointer */
 	dequeue(&dir_queue, entry);
 	
 	pthread_mutex_unlock(&queue_lock);
@@ -371,7 +399,7 @@ bool is_finished(void) {
 
 	/* Safely read the amount of running threads and the amount of waiting threads */
 	pthread_rwlock_rdlock(&shared_objects_rw_lock);
-	ret = (threads_cv_queue.size == running_threads - 1) && (dir_queue.size == 0); // all other threads are waiting and queue is empty (must be called after finishing the own work of the thread)
+	ret = (waiting_threads_queue.size >= running_threads - 1) && (dir_queue.size == 0); // all other threads are waiting and queue is empty (must be called after finishing the own work of the thread)
 	pthread_rwlock_unlock(&shared_objects_rw_lock);
 	
 	/* Return value */
@@ -401,6 +429,9 @@ int main(int args, char* argv[]) {
 	// create array to store thread-ids in
 	pthread_t thread_ids[num_threads];
 	
+	// initializaing locks and condition variables
+	init_peripherals();
+	
 	// creating and enqueue-ing the root directory queue entry
 	queue_entry_t *root_dir;
 	root_dir = malloc(sizeof(queue_entry_t));
@@ -425,6 +456,9 @@ int main(int args, char* argv[]) {
 	for (i = 0; i < num_threads; i++) {
 		pthread_join(thread_ids[i], NULL);
 	}
+	
+	// destroying locks and condition variables
+	destroy_peripherals();
 	
 	// print the amount of matches files
 	printf("Done searching, found %d files\n", pattern_matches);
