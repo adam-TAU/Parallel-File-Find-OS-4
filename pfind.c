@@ -62,8 +62,6 @@ static pthread_mutex_t all_threads_created_event_lock; // a lock for bounding th
 static pthread_cond_t all_threads_created_event; // condition for identifying a thread creation
 static pthread_mutex_t threads_start_event_lock; // a lock for the following condition variable
 static pthread_cond_t threads_start_event; // condition for identifying if searching threads are allowed to start working
-static pthread_mutex_t threads_finish_event_lock; // a lock for the following condition variable
-static pthread_cond_t threads_finish_event; // condition for identifying when no work is left (i.e., all threads are waiting for work)
 /***********************************************************************/
 
 
@@ -114,24 +112,20 @@ void handle_new_file(char filename[], char path[], char pattern[]);
  * On success, returns 0. */
 void append_path(char path[], char dirent_name[], char** new_path);
 
-/* Regular naive enqueue-ing of an entry into a queue. No synchronization involved */
-inline void enqueue(queue_t *queue, queue_entry_t *entry);
+/* Regular naive enqueue-ing of an entry into a FIFO queue. No synchronization involved */
+void enqueue(queue_t *queue, queue_entry_t *entry);
 
-/* Regular naive dequeue-ing of an entry into a queue. No synchronization involved */
-inline void dequeue(queue_t *queue, queue_entry_t *entry);
+/* Regular naive dequeue-ing of an entry from a FIFO queue. No synchronization involved */
+void dequeue(queue_t *queue, queue_entry_t **entry);
 
 /* A function dedicated to be ran by an auxiliary thread. This function accepts a string (the 
- * directory name in our case), and enqueues it synchronously into the given queue. 
-  
- * On success, returns 0. */
-int sync_enqueue(queue_t *queue, queue_entry_t *entry);
+ * directory name in our case), and enqueues it synchronously into the given queue. */
+void sync_enqueue(queue_t *queue, queue_entry_t *entry);
 
 /* A function dedicated to be ran by an auxiliary thread. This function accepts a string (the 
  * directory name in our case), and synchronously dequeues the first entry of the given queue 
- * into the string. 
-  
- * On success, returns 0. */
-int sync_dequeue(queue_t *queue, queue_entry_t *entry);
+ * into the string. */
+void sync_dequeue(queue_t *queue, queue_entry_t **entry);
 
 /* Checks if all searching threads that are alive are waiting for tasks.
  * If so, the program shall finish due to no work left, therefore this function
@@ -183,7 +177,7 @@ int atomic_create_threads(unsigned int num_threads, pthread_t* thread_ids, char 
 }
 
 void *thrd_reap_directories(void* pattern) {
-	queue_entry_t curr_dir_entry;
+	queue_entry_t *curr_dir_entry;
 
 	/* Signal the main thread about the thread creation */\
 	pthread_mutex_lock(&all_threads_created_event_lock);
@@ -203,22 +197,40 @@ void *thrd_reap_directories(void* pattern) {
 	/* Start searching */
 	while (true) {
 		sync_dequeue(&dir_queue, &curr_dir_entry); // thread-safe
-		dir_enum(curr_dir_entry.dir, curr_dir_entry.path, (char*) pattern); // thread-safe
-		
-		/* Check if all threads are waiting */
-		/* Must lock the queue lock - that way it is guaranteed that no thread is working (enqueue-ing/dequeue-ing) */
+		if (NULL != curr_dir_entry) { // sometimes sync_dequeue will dequeue an empty queue for the sake of making all threads exit
+			dir_enum(curr_dir_entry->dir, curr_dir_entry->path, (char*) pattern); // thread-safe
+		} else {
+			printf("%d\n", threads_finished);
+		}
+				
+		/* The thread reaches this block of code only in two cases:
+		 * 1. The sync_dequeue actually dequeue-ed a directory and enumerated it. If so, the thread
+		 * will check if the work is done (all threads are waiting), and if so, broadcast a signal 
+		 * to all of them so they can exit the sync_dequeue and reach this block.
+		 * 2. The sync_dequeue dequeue-ed a NULL entry since the queue was empty. In such case,
+		 * there was a thread who realized that there's no work left and that all threads should exit.
+		 * this code of block will end up in the thread exiting, since the <threads_finished> indicator
+		 * would be turned on */
 		pthread_mutex_lock(&queue_lock);
-		
-		if (is_finished()) { // verify that while all threads aren't working, all threads are sleeping
+		if (threads_finished) { // if a thread has already indicated to everyone that the work is done
+			pthread_mutex_unlock(&queue_lock);
+			pthread_exit(NULL); 
+		}
+		if (is_finished()) { // if no thread has indicated that the work is done
+			printf("broadcast\n");
 			threads_finished = true;
-			pthread_cond_signal(&threads_finish_event);
+			pthread_cond_broadcast(&queue_not_empty); // deceiving waiting threads to continue to this block of code
+			pthread_mutex_unlock(&queue_lock);
+			pthread_exit(NULL); 
 		}
 		
 		pthread_mutex_unlock(&queue_lock);
 	}
+	pthread_exit(NULL);
 }
 
 void dir_enum(DIR *dir, char path[], char pattern[]) {
+	struct stat entry_statbuf; // used to store data induced from `stat`-ing files
 	struct dirent *entry;
 	
 	while ( NULL != (entry = readdir(dir)) ) { // reading next dirent // error here
@@ -230,9 +242,7 @@ void dir_enum(DIR *dir, char path[], char pattern[]) {
 		append_path(path, entry->d_name, &entry_path);
 		
 		/* Getting the file type of the dirent */
-		struct stat entry_statbuf;
-		if (0 != stat(entry_path, &entry_statbuf)) {
-			printf("bad: %s\n", entry_path);
+		if (0 != lstat(entry_path, &entry_statbuf)) {
 			print_err("Error wiht `stat`-ing a dirent", true, false);
 		}
 		
@@ -282,26 +292,28 @@ void append_path(char path[], char dirent_name[], char** new_path) {
 	unsigned int new_path_len = strlen(path) + strlen(dirent_name) + 2;
 	
 	*new_path = (char*) malloc( sizeof(char) * new_path_len );
-	sprintf(*new_path, "%s/%s", path, dirent_name);
+	sprintf(*new_path, "%s/%s", path, dirent_name); // buffer-overflow vulnerability
 	(*new_path)[new_path_len - 1] = 0;
 }
 
-inline void enqueue(queue_t *queue, queue_entry_t *entry) {
+void enqueue(queue_t *queue, queue_entry_t *entry) {
 	entry->next = queue->head;
 	queue->head = entry;
 	queue->size++;
 }
 
-inline void dequeue(queue_t *queue, queue_entry_t *entry) {
-	*entry = *queue->head;
-	queue->head = queue->head->next;
-	queue->size--;
-	
+void dequeue(queue_t *queue, queue_entry_t **entry) {
+	if (queue->size == 0) {
+		*entry = NULL;
+	} else {
+		*entry = queue->head;
+		queue->head = queue->head->next;
+		queue->size--;
+	}
 }
 
 
-int sync_enqueue(queue_t *queue, queue_entry_t *entry) {
-	int status = 0;
+void sync_enqueue(queue_t *queue, queue_entry_t *entry) {
 	
 	/* Synchronization block start (can't terminate upon error, must engolf with status var */
 	pthread_mutex_lock(&queue_lock);
@@ -312,14 +324,10 @@ int sync_enqueue(queue_t *queue, queue_entry_t *entry) {
 	pthread_cond_signal(&queue_not_empty);
 	pthread_mutex_unlock(&queue_lock);
 	/* Synchronization block end */
-	
-	return status;
-	
 }
 
-int sync_dequeue(queue_t *queue, queue_entry_t *entry) {
-	int status = 0;
-	
+void sync_dequeue(queue_t *queue, queue_entry_t **entry) {
+
 	/* Synchronization block start (can't terminate upon error, must engolf with status var */
 	pthread_mutex_lock(&queue_lock);
 	waiting_threads++;
@@ -333,8 +341,6 @@ int sync_dequeue(queue_t *queue, queue_entry_t *entry) {
 	
 	pthread_mutex_unlock(&queue_lock);
 	/* Synchronization block end */
-	
-	return status;
 }
 
 bool is_finished(void) {
@@ -342,7 +348,7 @@ bool is_finished(void) {
 
 	/* Safely read the amount of running threads and the amount of waiting threads */
 	pthread_rwlock_rdlock(&shared_objects_rw_lock);
-	ret = (waiting_threads == running_threads) && (dir_queue.size == 0); // find a better correctness condition and act accordingly with synchronization
+	ret = (waiting_threads == running_threads - 1) && (dir_queue.size == 0); // all other threads are waiting and queue is empty (must be called after finishing the own work of the thread)
 	pthread_rwlock_unlock(&shared_objects_rw_lock);
 	
 	/* Return value */
@@ -392,11 +398,10 @@ int main(int args, char* argv[]) {
 	pthread_cond_broadcast(&threads_start_event);
 	
 	// wait for all threads to be finish working (if all are waiting, one of the searching threads will terminate the whole program)
-	pthread_mutex_lock(&threads_finish_event_lock);
-	if (!threads_finished) {
-		pthread_cond_wait(&threads_finish_event, &threads_finish_event_lock);
+	unsigned int i;
+	for (i = 0; i < num_threads; i++) {
+		pthread_join(thread_ids[i], NULL);
 	}
-	pthread_mutex_unlock(&threads_finish_event_lock);
 	
 	// print the amount of matches files
 	printf("Done searching, found %d files\n", pattern_matches);
