@@ -232,7 +232,8 @@ void dir_enum(DIR *dir, char path[], char pattern[]) {
 		/* Getting the file type of the dirent */
 		struct stat entry_statbuf;
 		if (0 != stat(entry_path, &entry_statbuf)) {
-			print_err("Error `stat`-ing a dirent", true, false);
+			printf("bad: %s\n", entry_path);
+			print_err("Error wiht `stat`-ing a dirent", true, false);
 		}
 		
 		/* If the entry points to a directory */
@@ -260,7 +261,6 @@ void handle_new_dir(char path[]) {
 	if ( NULL == (new_dir->dir = opendir(new_dir->path)) ) { // if an error occurred
 	
 		if (errno != EACCES) { // errors other than no permissions are treated as errors
-			printf("%s\n", path);
 			print_err("Error with using the `opendir` command on a new found directory", true, false);
 		} else { // simple permissions denial stdout message
 			printf("Directory %s: Permission denied.\n", path); 
@@ -342,7 +342,7 @@ bool is_finished(void) {
 
 	/* Safely read the amount of running threads and the amount of waiting threads */
 	pthread_rwlock_rdlock(&shared_objects_rw_lock);
-	ret = (waiting_threads == running_threads) || (dir_queue.size == 0);
+	ret = (waiting_threads == running_threads) && (dir_queue.size == 0); // find a better correctness condition and act accordingly with synchronization
 	pthread_rwlock_unlock(&shared_objects_rw_lock);
 	
 	/* Return value */
