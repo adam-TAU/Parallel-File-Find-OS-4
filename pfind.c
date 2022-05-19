@@ -257,6 +257,7 @@ void handle_new_dir(char path[]) {
 	if ( NULL == (new_dir->dir = opendir(new_dir->path)) ) { // if an error occurred
 	
 		if (errno != EACCES) { // errors other than no permissions are treated as errors
+			printf("%s\n", path);
 			print_err("Error with using the `opendir` command on a new found directory", true, false);
 		} else { // simple permissions denial stdout message
 			printf("Directory %s: Permission denied.\n", path); 
@@ -275,8 +276,11 @@ void handle_new_file(char filename[], char path[], char pattern[]) {
 }
 
 void append_path(char path[], char dirent_name[], char** new_path) {
-	*new_path = (char*) malloc( sizeof(char) * (strlen(path) + strlen(dirent_name) + 1) );
+	unsigned int new_path_len = strlen(path) + strlen(dirent_name) + 2;
+	
+	*new_path = (char*) malloc( sizeof(char) * new_path_len );
 	sprintf(*new_path, "%s/%s", path, dirent_name);
+	(*new_path)[new_path_len - 1] = 0;
 }
 
 inline void enqueue(queue_t *queue, queue_entry_t *entry) {
