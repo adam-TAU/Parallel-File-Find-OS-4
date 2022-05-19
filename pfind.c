@@ -220,7 +220,7 @@ void *thrd_reap_directories(void* pattern) {
 
 void dir_enum(DIR *dir, char path[], char pattern[]) {
 	struct dirent *entry;
-
+	
 	while ( NULL != (entry = readdir(dir)) ) { // reading next dirent // error here
 		/* Eliminating recurssive dir entries */
 		if ( (strcmp(entry->d_name, ".") == 0) || (strcmp(entry->d_name, "..") == 0) ) continue;
@@ -253,7 +253,7 @@ void handle_new_dir(char path[]) {
 	queue_entry_t *new_dir;
 	new_dir = malloc(sizeof(queue_entry_t));
 	new_dir->path = path;
-
+	
 	if ( NULL == (new_dir->dir = opendir(new_dir->path)) ) { // if an error occurred
 	
 		if (errno != EACCES) { // errors other than no permissions are treated as errors
@@ -365,11 +365,12 @@ int main(int args, char* argv[]) {
 	// create array to store thread-ids in
 	pthread_t thread_ids[num_threads];
 	
-	// enqueue-ing the root directory
+	// creating and enqueue-ing the root directory queue entry
 	queue_entry_t *root_dir;
 	root_dir = malloc(sizeof(queue_entry_t));
 	root_dir->path = root_dir_path;
 	root_dir->next = NULL;
+	if ( NULL == (root_dir->dir = opendir(root_dir->path)) ) exit(1);
 	enqueue(&dir_queue, root_dir);
 	
 	// create all threads and wait for all of them to be created
