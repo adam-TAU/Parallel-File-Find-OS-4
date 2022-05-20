@@ -57,7 +57,7 @@ static atomic_uint num_threads = 0; // the number of threads that were desired t
 static atomic_uint pattern_matches = 0; // the number of files that have been found to contain the pattern
 static atomic_uint failed_threads = 0; // the number of threads that have died due to an error
 static atomic_uint launched_threads = 0; // the number of threads that have been started
-static atomic_uint running_threads = 0; // the number of threads that have just dequeued an entry from the directory queue and are still processing it
+static atomic_uint working_threads = 0; // the number of threads that have just dequeued an entry from the directory queue and are still processing it
 static atomic_uint waiting_threads = 0; // indicated the number of threads that are waiting for work (i.e., went to sleep for work and have yet to be woken up)
 static atomic_int threads_started = false; // used as an indication for if the <threads_start> condition has already met
 static atomic_int threads_finished = false; // used as an indication for if all of the threads finished their work (i.e., all threads are waiting)
@@ -241,9 +241,9 @@ int thrd_reap_directories(void* pattern) {
 		sync_dequeue(&curr_dir_entry, &thread_cv_entry); // thread-safe
 		if (NULL != curr_dir_entry) { // sometimes sync_dequeue will dequeue an empty queue for the sake of exiting
 			dir_enum(curr_dir_entry->dir, curr_dir_entry->path, (char*) pattern); // thread-safe
-			free(curr_dir_entry);
+			working_threads--;
+			free(curr_dir_entry); // free-ing un-used memory
 		}
-		running_threads--;
 		
 		/* Either another thread has freed this thread's lock to finish it, 
 		 * or this thread needs to check for if there is no work left */
@@ -385,16 +385,16 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 		waiting_threads++;
 		enqueue(&waiting_threads_queue, thread_cv_entry);
 		while (dir_queue.size == 0 && !threads_finished) { // stop if the queue is not empty or if the work is done
-			printf("sleeping: %lu, running: %u, waiting: %u, tasks: %u\n", thrd_current(), running_threads, waiting_threads_queue.size, dir_queue.size);
+			// printf("sleeping: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
 			cnd_wait(&thread_cv_entry->queue_not_empty_event, &queue_lock); // sleep
-			printf("awakening: %lu, running: %u, waiting: %u, tasks: %u\n", thrd_current(), running_threads, waiting_threads_queue.size, dir_queue.size);
+			// printf("awakening: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
 		}
 		waiting_threads--;
 	}
 	
 	// remove the directory at the head of the FIFO queue
-	printf("processing: %lu, running: %u, waiting: %u, tasks: %u\n", thrd_current(), running_threads, waiting_threads_queue.size, dir_queue.size);
-	running_threads++;
+	// printf("processing: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
+	working_threads++;
 	dequeue(&dir_queue, entry);
 	
 	mtx_unlock(&queue_lock);
@@ -409,7 +409,7 @@ yield_cpu:
 
 bool is_finished(void) {
 	// all other threads are waiting and queue is empty (must be called after finishing the own work of the thread)
-	bool ret = (waiting_threads_queue.size >= running_threads - 1) && (dir_queue.size == 0); 
+	bool ret = (working_threads == 0) && (dir_queue.size == 0); 
 	return ret;
 }
 /*******************************************************************************************/
