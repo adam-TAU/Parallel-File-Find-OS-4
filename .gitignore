@@ -5,3 +5,4 @@ tester_sid/sid_source/*
 tester_sid/test-debug.log
 tester_sid/test_filesystem/
 tester_sid/pfind
+pfind
