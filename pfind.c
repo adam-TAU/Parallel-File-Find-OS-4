@@ -119,7 +119,7 @@ void handle_new_file(char filename[], char path[], char pattern[]);
  
  * Doesn't synchronize anything (allows for termination upon finding an error)
  * On success, returns 0. */
-void append_path(char path[], char dirent_name[], char** new_path);
+void append_path(char path[], char dirent_name[], char* new_path[]);
 
 /* Regular naive enqueue-ing of an entry into a FIFO queue. No synchronization involved */
 void enqueue(queue_t *queue, queue_entry_t *entry);
@@ -138,7 +138,9 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry);
 
 /* Checks if all searching threads that are alive are waiting for tasks.
  * If so, the program shall finish due to no work left, therefore this function
- * will return true. Else, returns false. */
+ * will return true. Else, returns false. This function must not be placed inbetween 
+ * the point of acquiring a directory to search, and the end of the enumeration of
+ * the directory. */
 bool is_finished(void);
 /*******************************************************************************************/
 
@@ -238,10 +240,9 @@ void *thrd_reap_directories(void* pattern) {
 		sync_dequeue(&curr_dir_entry, &thread_cv_entry); // thread-safe
 		if (NULL != curr_dir_entry) { // sometimes sync_dequeue will dequeue an empty queue for the sake of exiting
 			dir_enum(curr_dir_entry->dir, curr_dir_entry->path, (char*) pattern); // thread-safe
-		} else {
-			printf("%d\n", threads_finished);
+			free(curr_dir_entry);
 		}
-				
+
 		/* The thread reaches this block of code only in two cases:
 		 * 1. The sync_dequeue actually dequeue-ed a directory and enumerated it. If so, the thread
 		 * will check if the work is done (all threads are waiting), and if so, broadcast a signal 
@@ -255,6 +256,7 @@ void *thrd_reap_directories(void* pattern) {
 			pthread_mutex_unlock(&queue_lock);
 			break;
 		}
+		
 		if (is_finished()) { // if no thread has indicated that the work is done
 			threads_finished = true;
 			release_all_threads();
@@ -327,7 +329,7 @@ void handle_new_file(char filename[], char path[], char pattern[]) {
 	}
 }
 
-void append_path(char path[], char dirent_name[], char** new_path) {
+void append_path(char path[], char dirent_name[], char* new_path[]) {
 	unsigned int new_path_len = strlen(path) + strlen(dirent_name) + 2;
 	
 	*new_path = (char*) malloc( sizeof(char) * new_path_len );
@@ -379,11 +381,13 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 	pthread_mutex_lock(&queue_lock);
 	
 	/* Add the condition variable of this thread to the queue */
-	if (dir_queue.size == 0) {
-		enqueue(&waiting_threads_queue, thread_cv_entry);
-		while (dir_queue.size == 0 && !threads_finished) {
-			pthread_cond_wait(&thread_cv_entry->queue_not_empty_event, &queue_lock);
-			printf("nothing\n");
+	printf("broadcast_info %u %u %u %lu\n", waiting_threads_queue.size, running_threads, dir_queue.size, pthread_self());
+	if (dir_queue.size == 0) { // don't sleep unless the queue is empty upon arrival
+		enqueue(&waiting_threads_queue, thread_cv_entry); // list the thread up for wake-up services
+		while (dir_queue.size == 0 && !threads_finished) { // stop if the queue is not empty or if the work is done
+			printf("broadcast_sleep %u %u %u %lu\n", waiting_threads_queue.size, running_threads, dir_queue.size, pthread_self());
+			pthread_cond_wait(&thread_cv_entry->queue_not_empty_event, &queue_lock); // sleep
+			printf("broadcast_wake %u %u %u %lu\n", waiting_threads_queue.size, running_threads, dir_queue.size, pthread_self());
 		}
 	}
 	
