@@ -55,13 +55,13 @@ valid_file_chars = build_valid_chars()
 def parallelism_generator():
     for _ in range(10):
         yield 1
-    for _ in range(150 if IS_HARD else 50):
+    for _ in range(150 if IS_HARD else 25):
         yield 2
-    for i in range(10, 100, 10 if IS_HARD else 25):
+    for i in range(10, 100, 25 if IS_HARD else 50):
         yield i
-    for i in range(100, 1000, 50 if IS_HARD else 150):
+    for i in range(100, 1001, 150 if IS_HARD else 500):
         yield i
-    for i in range(1000, 4001, 100 if IS_HARD else 500):
+    for i in range(1000, 2501, 500 if IS_HARD else 1000): # used to be up to 4000
         yield i
 
 
@@ -466,7 +466,7 @@ def run_all_tests(timeout: int):
 
     tests_amt = 0
     failed_amt = 0
-    for _ in range(30 if IS_HARD else 10):
+    for _ in range(30 if IS_HARD else 3):
         total_normal, failed_normal = test_normal_run(timeout)
         total_links, failed_links = test_links_run(timeout)
         total_unsearchable, failed_unsearchable = test_unsearchable_dir_run(timeout)

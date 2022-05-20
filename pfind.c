@@ -291,7 +291,7 @@ void dir_enum(DIR *dir, char path[], char pattern[]) {
 		}
 		
 		/* If the entry points to a file */
-		else if (S_ISREG(entry_statbuf.st_mode)) {
+		else if (S_ISREG(entry_statbuf.st_mode) || S_ISLNK(entry_statbuf.st_mode)) { // remove the symlink counting if not needed
 			handle_new_file(entry->d_name, entry_path, pattern);
 			continue;
 		}
