@@ -56,6 +56,7 @@ static queue_t waiting_threads_queue = {0};
 static atomic_uint num_threads = 0; // the number of threads that were desired to be launched
 static atomic_uint pattern_matches = 0; // the number of files that have been found to contain the pattern
 static atomic_uint running_threads = 0; // the number of threads that haven't encountered an error
+static atomic_uint waiting_threads = 0; // indicated the number of threads that are waiting for work (i.e., went to sleep for work and have yet to be woken up)
 static atomic_int threads_started = false; // used as an indication for if the <threads_start> condition has already met
 static atomic_int threads_finished = false; // used as an indication for if all of the threads finished their work (i.e., all threads are waiting)
 static mtx_t queue_lock; // mutual excluder for queue operations
@@ -373,23 +374,25 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 	/* Synchronization block start */
 	mtx_lock(&queue_lock);
 	
-	if (waiting_threads_queue.size != 0) { // if there are threads that are sleeping, we must let them finish their work first
+	if (waiting_threads != 0) { // if there are threads that are sleeping, we must let them finish their work first
 		mtx_unlock(&queue_lock);
 		goto yield_cpu;
 	}
 	
 	if (dir_queue.size == 0 && !threads_finished) { // don't sleep unless the queue is empty upon arrival and there is still work left
 		// adding this thread to the waiting list
+		waiting_threads++;
 		enqueue(&waiting_threads_queue, thread_cv_entry);
 		while (dir_queue.size == 0 && !threads_finished) { // stop if the queue is not empty or if the work is done
-			// printf("sleeping: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
+			printf("sleeping: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
 			cnd_wait(&thread_cv_entry->queue_not_empty_event, &queue_lock); // sleep
-			// printf("awakening: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
+			printf("awakening: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
 		}
+		waiting_threads--;
 	}
 	
 	// remove the directory at the head of the FIFO queue
-	// printf("processing: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
+	printf("processing: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
 	dequeue(&dir_queue, entry);
 	
 	mtx_unlock(&queue_lock);
