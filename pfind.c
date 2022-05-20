@@ -98,6 +98,12 @@ void release_all_threads(void);
  * from the aforesaid queue and enumerates it for files who hold the pattern we're search for */ 
 int thrd_reap_directories(void* pattern);
 
+/* This function acquire a lock over the directory queue, and checks if there is need to 
+ * let all threads know the work is done, or if someone has already terminated it (which would
+ * raise the flag of <threads_finished> up) and therefore the thread needs to implicitly
+ * exit */
+bool check_to_terminate(void);
+
 /* A function dedicated to be ran by an auxiliary thread. This function accepts a directory,
  * enumerates it, prints pattern-matched files in the directory, and potentially enters new 
  * directory queue entries into the waiting directory queue. 
@@ -159,7 +165,12 @@ void print_err(char* error_message, bool thread_exit, bool program_exit) {
 	perror(error_message); // this basically prints error_message, with <strerror(errno)> appended to it */
 	errno = tmp_errno;
 	
-	if (thread_exit) {
+	if (thread_exit) {	
+		mtx_lock(&queue_lock);
+		working_threads--; // this function is called only from within the <dir_enum> function which is considered working
+		// check if there is need to terminate the program after exiting this thread
+		check_to_terminate();
+		mtx_unlock(&queue_lock);
 		failed_threads++;
 		thrd_exit(1); // exiting the thread
 	}
@@ -247,24 +258,30 @@ int thrd_reap_directories(void* pattern) {
 		
 		/* Either another thread has freed this thread's lock to finish it, 
 		 * or this thread needs to check for if there is no work left */
-		mtx_lock(&queue_lock);
-		if (threads_finished) { // if a thread has already indicated to everyone that the work is done
-			mtx_unlock(&queue_lock);
-			break;
-		}
-		
-		if (is_finished()) { // if no thread has indicated that the work is done
-			threads_finished = true;
-			release_all_threads();
-			mtx_unlock(&queue_lock);
-			break;
-		}
-		mtx_unlock(&queue_lock);
+		if (check_to_terminate()) break;
 	}
 	
 	// destroy the thread-specific lock and exit
 	cnd_destroy(&thread_cv_entry.queue_not_empty_event);
 	thrd_exit(1); 
+}
+
+bool check_to_terminate(void) {
+	mtx_lock(&queue_lock);
+	if (threads_finished) { // if a thread has already indicated to everyone that the work is done
+		mtx_unlock(&queue_lock);
+		return true;
+	}
+	
+	if (is_finished()) { // if no thread has indicated that the work is done
+		threads_finished = true;
+		release_all_threads();
+		mtx_unlock(&queue_lock);
+		return true;
+	}
+	mtx_unlock(&queue_lock);
+	
+	return false;
 }
 
 void dir_enum(DIR *dir, char path[], char pattern[]) {
