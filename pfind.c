@@ -384,15 +384,15 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 		waiting_threads++;
 		enqueue(&waiting_threads_queue, thread_cv_entry);
 		while (dir_queue.size == 0 && !threads_finished) { // stop if the queue is not empty or if the work is done
-			printf("sleeping: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
+			// printf("sleeping: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
 			cnd_wait(&thread_cv_entry->queue_not_empty_event, &queue_lock); // sleep
-			printf("awakening: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
+			// printf("awakening: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
 		}
 		waiting_threads--;
 	}
 	
 	// remove the directory at the head of the FIFO queue
-	printf("processing: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
+	// printf("processing: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
 	dequeue(&dir_queue, entry);
 	
 	mtx_unlock(&queue_lock);
