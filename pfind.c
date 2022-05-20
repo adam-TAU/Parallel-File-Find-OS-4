@@ -55,7 +55,9 @@ static queue_t dir_queue = {0};
 static queue_t waiting_threads_queue = {0};
 static atomic_uint num_threads = 0; // the number of threads that were desired to be launched
 static atomic_uint pattern_matches = 0; // the number of files that have been found to contain the pattern
-static atomic_uint running_threads = 0; // the number of threads that haven't encountered an error
+static atomic_uint failed_threads = 0; // the number of threads that have died due to an error
+static atomic_uint launched_threads = 0; // the number of threads that have been started
+static atomic_uint running_threads = 0; // the number of threads that have just dequeued an entry from the directory queue and are still processing it
 static atomic_uint waiting_threads = 0; // indicated the number of threads that are waiting for work (i.e., went to sleep for work and have yet to be woken up)
 static atomic_int threads_started = false; // used as an indication for if the <threads_start> condition has already met
 static atomic_int threads_finished = false; // used as an indication for if all of the threads finished their work (i.e., all threads are waiting)
@@ -158,9 +160,7 @@ void print_err(char* error_message, bool thread_exit, bool program_exit) {
 	errno = tmp_errno;
 	
 	if (thread_exit) {
-		mtx_lock(&queue_lock);
-		running_threads--;
-		mtx_unlock(&queue_lock);
+		failed_threads++;
 		thrd_exit(1); // exiting the thread
 	}
 	
@@ -197,7 +197,7 @@ int atomic_create_threads(unsigned int num_threads, thrd_t* thread_ids, char pat
 	
 	/* Waiting for the last thread created to signal that he's the last and all have been created */
 	mtx_lock(&all_threads_created_event_lock);
-	if (running_threads != num_threads) {
+	if (launched_threads != num_threads) {
 		cnd_wait(&all_threads_created_event, &all_threads_created_event_lock);
 	}
 	mtx_unlock(&all_threads_created_event_lock);
@@ -223,8 +223,8 @@ int thrd_reap_directories(void* pattern) {
 	
 	// Signal the main thread about the thread creation 
 	mtx_lock(&all_threads_created_event_lock);
-	running_threads++;
-	if (running_threads == num_threads) {
+	launched_threads++;
+	if (launched_threads == num_threads) {
 		cnd_signal(&all_threads_created_event);
 	}
 	mtx_unlock(&all_threads_created_event_lock);
@@ -243,6 +243,7 @@ int thrd_reap_directories(void* pattern) {
 			dir_enum(curr_dir_entry->dir, curr_dir_entry->path, (char*) pattern); // thread-safe
 			free(curr_dir_entry);
 		}
+		running_threads--;
 		
 		/* Either another thread has freed this thread's lock to finish it, 
 		 * or this thread needs to check for if there is no work left */
@@ -384,15 +385,16 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 		waiting_threads++;
 		enqueue(&waiting_threads_queue, thread_cv_entry);
 		while (dir_queue.size == 0 && !threads_finished) { // stop if the queue is not empty or if the work is done
-			// printf("sleeping: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
+			printf("sleeping: %lu, running: %u, waiting: %u, tasks: %u\n", thrd_current(), running_threads, waiting_threads_queue.size, dir_queue.size);
 			cnd_wait(&thread_cv_entry->queue_not_empty_event, &queue_lock); // sleep
-			// printf("awakening: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
+			printf("awakening: %lu, running: %u, waiting: %u, tasks: %u\n", thrd_current(), running_threads, waiting_threads_queue.size, dir_queue.size);
 		}
 		waiting_threads--;
 	}
 	
 	// remove the directory at the head of the FIFO queue
-	// printf("processing: %lu, waiting: %u, tasks: %u\n", thrd_current(), waiting_threads_queue.size, dir_queue.size);
+	printf("processing: %lu, running: %u, waiting: %u, tasks: %u\n", thrd_current(), running_threads, waiting_threads_queue.size, dir_queue.size);
+	running_threads++;
 	dequeue(&dir_queue, entry);
 	
 	mtx_unlock(&queue_lock);
@@ -469,7 +471,7 @@ int main(int args, char* argv[]) {
 	printf("Done searching, found %d files\n", pattern_matches);
 	
 	// verifying that no threads have failed during the searching
-	if (running_threads < num_threads) {
+	if (failed_threads > 0) {
 		exit_status = 1;
 	}
 
