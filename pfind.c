@@ -10,8 +10,9 @@
 
 
 /****************************** HIGHLIGHTS: TODO ****************************
-	1. cleanup code
-	2. verify if symbolic links should be counted when searching for matching files
+	1. resolve memory issue at line 326
+	2. synchronize the termination process
+	3. rename some variables
 ****************************** HIGHLIGHTS: TODO ****************************/
 
 
@@ -59,7 +60,7 @@ static atomic_uint working_threads = 0; // the number of threads that have just 
 static atomic_uint waiting_threads = 0; // indicated the number of threads that are waiting for work (i.e., went to sleep for work and have yet to be woken up)
 static atomic_int threads_started = false; // used as an indication for if the <threads_start> condition has already met
 static atomic_int threads_finished = false; // used as an indication for if all of the threads finished their work (i.e., all threads are waiting)
-static mtx_t queue_lock; // mutual excluder for queue operations
+static mtx_t protocol_lock; // mutual excluder for queue operations
 static mtx_t all_threads_created_event_lock; // a lock for bounding the thread creation condition-variable use
 static cnd_t all_threads_created_event; // condition for identifying a thread creation
 static mtx_t threads_start_event_lock; // a lock for the following condition variable
@@ -257,7 +258,7 @@ void append_path(char dir_path[], char dirent_name[], char* dirent_path[]);
 
 /****************************** MAIN-THREAD: PROGRAM CONTROL ****************************/
 void init_peripherals(void) {
-	mtx_init(&queue_lock, mtx_plain);
+	mtx_init(&protocol_lock, mtx_plain);
 	mtx_init(&all_threads_created_event_lock, mtx_plain);
 	mtx_init(&threads_start_event_lock, mtx_plain);
 	cnd_init(&all_threads_created_event);
@@ -265,7 +266,7 @@ void init_peripherals(void) {
 }
 
 void destroy_peripherals(void) {
-	mtx_destroy(&queue_lock);
+	mtx_destroy(&protocol_lock);
 	mtx_destroy(&all_threads_created_event_lock);
 	mtx_destroy(&threads_start_event_lock);
 	cnd_destroy(&all_threads_created_event);
@@ -387,7 +388,7 @@ void sync_enqueue(queue_entry_t *dir_queue_entry) {
 	queue_entry_t *thread_cv_entry;
 	
 	/* Synchronization block start (can't terminate upWon error, must engolf with status var */
-	mtx_lock(&queue_lock);
+	mtx_lock(&protocol_lock);
 	
 	// Add directory entry to queue
 	enqueue(&dir_queue, dir_queue_entry);
@@ -398,14 +399,14 @@ void sync_enqueue(queue_entry_t *dir_queue_entry) {
 		cnd_signal(&thread_cv_entry->queue_not_empty_event);
 	}
 	
-	mtx_unlock(&queue_lock);
+	mtx_unlock(&protocol_lock);
 	/* Synchronization block end */
 }
 
 void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 	
 	/* Synchronization block start */
-	mtx_lock(&queue_lock);
+	mtx_lock(&protocol_lock);
 	
 	if ( (waiting_threads >= dir_queue.size) && !threads_finished) { // less directories to search than waiting threads means that 
 		// adding this thread to the waiting list
@@ -413,7 +414,7 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 		enqueue(&waiting_threads_queue, thread_cv_entry);
 		do { // stop if the queue is not empty or if the work is done
 			// printf("sleeping: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
-			cnd_wait(&thread_cv_entry->queue_not_empty_event, &queue_lock); // sleep
+			cnd_wait(&thread_cv_entry->queue_not_empty_event, &protocol_lock); // sleep
 			// printf("awakening: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
 		} while (dir_queue.size == 0 && !threads_finished);
 		waiting_threads--;
@@ -424,24 +425,24 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 	working_threads++;
 	dequeue(&dir_queue, entry);
 	
-	mtx_unlock(&queue_lock);
+	mtx_unlock(&protocol_lock);
 	/* Synchronization block end */
 }
 
 bool check_to_terminate(void) {
-	mtx_lock(&queue_lock);
+	mtx_lock(&protocol_lock);
 	if (threads_finished) { // if a thread has already indicated to everyone that the work is done
-		mtx_unlock(&queue_lock);
+		mtx_unlock(&protocol_lock);
 		return true;
 	}
 	
 	if (is_finished()) { // if no thread has indicated that the work is done
 		threads_finished = true;
 		release_all_threads();
-		mtx_unlock(&queue_lock);
+		mtx_unlock(&protocol_lock);
 		return true;
 	}
-	mtx_unlock(&queue_lock);
+	mtx_unlock(&protocol_lock);
 	
 	return false;
 }
@@ -479,7 +480,7 @@ void handle_dirent(char dir_path[], char dirent_name[], char pattern[]) {
 	append_path(dir_path, dirent_name, &dirent_path);
 	
 	/* Getting the file type of the dirent */
-	if (0 != lstat(dirent_path, &dirent_statbuf)) { // change to `stat`
+	if (0 != stat(dirent_path, &dirent_statbuf)) {
 		print_err("Error with `stat`-ing a dirent", true, false);
 	}
 	
@@ -546,11 +547,11 @@ void print_err(char error_message[], bool thread_exit, bool program_exit) {
 	errno = tmp_errno;
 	
 	if (thread_exit) {	
-		mtx_lock(&queue_lock);
+		mtx_lock(&protocol_lock);
 		working_threads--; // this function is called only from within the <dir_enum> function which is considered working
 		// check if there is need to terminate the program after exiting this thread
 		check_to_terminate();
-		mtx_unlock(&queue_lock);
+		mtx_unlock(&protocol_lock);
 		failed_threads++;
 		thrd_exit(1); // exiting the thread
 	}
