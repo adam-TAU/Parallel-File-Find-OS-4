@@ -13,6 +13,7 @@
 	1. resolve memory issue at line 326
 	2. synchronize the termination process
 	3. rename some variables
+	4. sid tester is acting up
 ****************************** HIGHLIGHTS: TODO ****************************/
 
 
@@ -321,8 +322,10 @@ int thrd_reap_directories(void* pattern) {
 		
 		// handling of the directory we have just dequeued
 		if (NULL != curr_dir_entry) { // avoiding dequeue-ing of an empty queue
+			working_threads++;
 			dir_enum(curr_dir_entry->dir, curr_dir_entry->path, (char*) pattern); // thread-safe
 			working_threads--;
+			// working_threads--;
 			
 			// free-ing un-used memory
 			// if (NULL != curr_dir_entry->path) free(curr_dir_entry->path); // problematic (memory-wise)
@@ -408,7 +411,7 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 	/* Synchronization block start */
 	mtx_lock(&protocol_lock);
 	
-	if ( (waiting_threads >= dir_queue.size) && !threads_finished) { // less directories to search than waiting threads means that 
+	if ( (waiting_threads > 0) && !threads_finished) { // if there are sleeping threads, they must process directories first. // less directories to search than waiting threads means that 
 		// adding this thread to the waiting list
 		waiting_threads++;
 		enqueue(&waiting_threads_queue, thread_cv_entry);
@@ -422,7 +425,6 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 	
 	// remove the directory at the head of the FIFO queue
 	// printf("processing: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
-	working_threads++;
 	dequeue(&dir_queue, entry);
 	
 	mtx_unlock(&protocol_lock);
@@ -431,6 +433,7 @@ void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_cv_entry) {
 
 bool check_to_terminate(void) {
 	mtx_lock(&protocol_lock);
+	
 	if (threads_finished) { // if a thread has already indicated to everyone that the work is done
 		mtx_unlock(&protocol_lock);
 		return true;
@@ -480,7 +483,7 @@ void handle_dirent(char dir_path[], char dirent_name[], char pattern[]) {
 	append_path(dir_path, dirent_name, &dirent_path);
 	
 	/* Getting the file type of the dirent */
-	if (0 != stat(dirent_path, &dirent_statbuf)) {
+	if (0 != lstat(dirent_path, &dirent_statbuf)) {
 		print_err("Error with `stat`-ing a dirent", true, false);
 	}
 	

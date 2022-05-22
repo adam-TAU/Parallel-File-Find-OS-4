@@ -468,8 +468,11 @@ def run_all_tests(timeout: int):
     failed_amt = 0
     for _ in range(30 if IS_HARD else 3):
         total_normal, failed_normal = test_normal_run(timeout)
+        print("failed: {}".format(failed_normal))
         total_links, failed_links = test_links_run(timeout)
+        print("failed: {}".format(failed_links))
         total_unsearchable, failed_unsearchable = test_unsearchable_dir_run(timeout)
+        print("failed: {}".format(failed_unsearchable))
         total_all, failed_all = test_all(timeout)
         tests_amt += total_normal + total_links + total_unsearchable + total_all
         failed_amt += failed_normal + failed_links + failed_unsearchable + failed_all
