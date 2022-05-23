@@ -11,8 +11,7 @@
 
 /****************************** HIGHLIGHTS: TODO ****************************
 	1. resolve memory issue at line 326
-	2. sid tester is acting up
-	3. sometimes, with a large amount of threads, we miss some files - check this
+	2. sid tester is acting up at unsearchable dir test run
 ****************************** HIGHLIGHTS: TODO ****************************/
 
 
@@ -47,12 +46,13 @@ typedef struct queue_entry_t {
 
 typedef struct queue_t {
 	queue_entry_t *head;
+	queue_entry_t *tail;
 	atomic_uint size;
 } queue_t;
 /*******************************************************************/
 
 
-
+static atomic_uint tmp = 0;
 
 
 /****************************** GLOBAL VARS ****************************/
@@ -315,6 +315,7 @@ int thrd_reap_directories(void* pattern) {
 	/* creating a dedicated condition variable for this thread to use to be woken up for work with */
 	queue_entry_t *thread_entry;
 	thread_entry = malloc(sizeof(queue_entry_t));
+	thread_entry->dir_queue_entry = NULL;
 	cnd_init(&thread_entry->thread_queue_not_empty_event);
 	
 	/* block the thread code until we are able to start working */
@@ -329,7 +330,6 @@ int thrd_reap_directories(void* pattern) {
 		if (NULL != thread_entry->dir_queue_entry) { // avoiding dequeue-ing of an empty queue
 			// enumerate new deququed directory
 			dir_enum(thread_entry->dir_queue_entry->dir, thread_entry->dir_queue_entry->path, (char*) pattern); // thread-safe
-			
 			
 			// free-ing un-used memory of the processed directory entry
 			// if (NULL != thread_entry->dir_queue_entry->path) free(thread_entry->dir_queue_entry->path); // problematic (memory-wise)
@@ -397,16 +397,16 @@ void sync_enqueue(queue_entry_t *dir_queue_entry) {
 	
 	/* Synchronization block start */
 	mtx_lock(&protocol_lock);
-	
-	// dequeue the first thread who went to sleep
-	dequeue(&waiting_threads_queue, &thread_entry);
-	
-	if (NULL == thread_entry) { // if no threads are sleeping, simply enqueue the new directory to the <dir_queue>
+		
+	if (waiting_threads_queue.size == 0) { // if no threads are sleeping, simply enqueue the new directory to the <dir_queue>
 		enqueue(&dir_queue, dir_queue_entry);
 		
-	} else { // if there are sleeping threads, we must serve the currently enqueuq-ed directory to the first sleeping thread
+	} else { // if there are sleeping threads, we must serve the currently enqueuq-ed directory to the first sleeping thread	
+		// dequeue the first thread who went to sleep
+		dequeue(&waiting_threads_queue, &thread_entry);
 		thread_entry->dir_queue_entry = dir_queue_entry; // attaching the new enqueued directory to the very first sleeping thread
 		cnd_signal(&thread_entry->thread_queue_not_empty_event); // waking the very first sleeping thread of the queue
+		working_threads++; // a thread with a dedicated and valid directory he needs to enumerate is considered working
 	}
 	
 	mtx_unlock(&protocol_lock);
@@ -418,26 +418,26 @@ void sync_dequeue(queue_entry_t *thread_entry) {
 	/* Synchronization block start */
 	mtx_lock(&protocol_lock);
 	
-	// find a directory to process
-	if ( dir_queue.size == 0 && !threads_finished ) { // if there are no directories left to process, go to sleep 
-		// adding this thread to the waiting list
-		waiting_threads++;
-		enqueue(&waiting_threads_queue, thread_entry);
-		
-		// wait for an enqueuer to wake you up with a task
-		printf("sleeping: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
-		cnd_wait(&thread_entry->thread_queue_not_empty_event, &protocol_lock);
-		printf("awakening: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
-		waiting_threads--;
-		
-	} else { // if there are directories to process, remove first directory at <dir_queue>
-		dequeue(&dir_queue, &thread_entry->dir_queue_entry);
+	
+	if ( !threads_finished ) { // if there is more work to do, find a directory to process
+		if ( dir_queue.size != 0 ) { // if there are directories available process, remove first directory at <dir_queue>
+			dequeue(&dir_queue, &thread_entry->dir_queue_entry);
+			working_threads++; // we have a directory to enumerate, hence this thread is working
+		} else { // if there are no directories currently available to process, go to sleep
+			// adding this thread to the waiting list
+			waiting_threads++;
+			enqueue(&waiting_threads_queue, thread_entry);
+			
+			// wait for an enqueuer to wake you up with a task
+			// printf("sleeping: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
+			cnd_wait(&thread_entry->thread_queue_not_empty_event, &protocol_lock);
+			// printf("awakening: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
+			waiting_threads--;
+		}
 	}
 	
-	// if there was a directory that was dequeue-ed, this thread is considered working from now on, so we increment <working_threads>
-	if (thread_entry->dir_queue_entry != NULL) working_threads++; 
-	
-	printf("processing: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
+
+	// printf("processing: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
 	/* Synchronization block end */
 	mtx_unlock(&protocol_lock);
 }
@@ -446,7 +446,7 @@ bool check_to_terminate(void) {
 	mtx_lock(&protocol_lock);
 	
 	// after enumerating the directory, we had done working, so we decrease this global variable (which was incremented at sync_dequeue)
-	if (working_threads > 0) working_threads--;
+	working_threads--;
 	
 	if (threads_finished) { // if a thread has already indicated to everyone that the work is done
 		mtx_unlock(&protocol_lock);
@@ -492,12 +492,14 @@ void dir_enum(DIR *dir, char dir_path[], char pattern[]) {
 void handle_dirent(char dir_path[], char dirent_name[], char pattern[]) {
 	struct stat dirent_statbuf; // used to store data induced from `stat`-ing files
 
+	tmp++;
+
 	/* Joining the path of the directory and the <dirent>'s */
 	char* dirent_path;
 	append_path(dir_path, dirent_name, &dirent_path);
 	
 	/* Getting the file type of the dirent */
-	if (0 != lstat(dirent_path, &dirent_statbuf)) {
+	if (0 != lstat(dirent_path, &dirent_statbuf)) { // TODO: change to stat
 		print_err("Error with `stat`-ing a dirent", true, false);
 	}
 	
@@ -544,7 +546,7 @@ void handle_new_file(char dirent_name[], char dirent_path[], char pattern[]) {
 
 bool is_finished(void) {
 	// all other threads are waiting and queue is empty (must be called after finishing the own work of the thread)
-	bool ret = (working_threads == 0) && (dir_queue.size == 0); 
+	bool ret = (working_threads == 0) && (dir_queue.size == 0);
 	return ret;
 }
 /*******************************************************************************************/
@@ -578,8 +580,15 @@ void print_err(char error_message[], bool thread_exit, bool main_exit) {
 }
 
 void enqueue(queue_t *queue, queue_entry_t *entry) {
-	entry->next = queue->head;
-	queue->head = entry;
+	if (queue->size == 0) {
+		queue->head = entry;
+		
+	} else {
+		queue->tail->next = entry;
+	}
+	
+	queue->tail = entry;
+	queue->tail->next = NULL;
 	queue->size++;
 }
 
