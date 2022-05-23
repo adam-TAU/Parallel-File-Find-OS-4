@@ -52,7 +52,6 @@ typedef struct queue_t {
 /*******************************************************************/
 
 
-static atomic_uint tmp = 0;
 
 
 /****************************** GLOBAL VARS ****************************/
@@ -141,21 +140,26 @@ void start_fence(void);
 /****************************** PROTOCOL'S API ***************************/
 /*************************************************************************/
 /* @user: 	thread-local -> used to enqueue new directories found into the protocol's FIFO Queue
- * @action: grabs a lock over the protocol, and inserts the new directory into the FIFO Queue. 
- *			Then, this function also signals the condition variable of the first entry it
- *			dequeues from <waiting_threads_queue> - to wake up the first-to-sleep thread.
+ * @action: grabs a lock over the protocol, and searches if there are sleeping threads. If there
+ *			are, then it will assign the <dir_queue_entry> processing job to the first to-sleep
+ *			thread (by dequeue-ing the thread entry from <waiting_threads_queue> FIFO queue and
+ *			putting in its <dir_queue_entry> *field* the *argument* <dir_queue_entry>), without 
+ *			inserting <dir_queue_entry> into the <dir_queue> which holds directories which are 
+ *			allowed to be processed by any thread (notice: this maintains FIFO order over the work
+ *			that sleeping threads do). If there are	no sleeping threads, then it regularly inserts
+ *			this directory processing job into the end of the <dir_queue> - which holds all possible
+ *			directories to enumerate.
  * @ret:	VOID
  * @errors:	NONE */
-void sync_enqueue(queue_entry_t *entry);
+void sync_enqueue(queue_entry_t *dir_queue_entry);
 
 /* @user: 	thread-local -> used to dequeue a directory from the protocol's FIFO Queue
- * @action: grabs a lock over the protocol, and tries to dequeue a directory from the
- *			FIFO Queue. If there are none, it goes to sleep. If there are already sleeping
- *			threads, it must go to sleep in order to maintain FIFO order of distribution of
- *			work. In case it goes to sleep, it enqueues itself to the <waiting_threads_queue>
- *			so that it will wake up after all other sleeping threads have woke up, and also
- *			increments the <waiting_threads> variable which indicates the amount of threads
- *			which are currently awaiting a directory to process 
+ * @action: grabs a lock over the protocol, and if the <dir_queue> FIFO queue of allowed
+ *			-directories-to-process is not empty, it dequeues a directory from there
+ *			and returns. If the aforementioned queue is in fact empty, then this thread
+ *			enters a sleeping mode, until a dedicated <sync_enqueue> dequeues its entry
+ *			from the <waiting_threads_queue> queue and assigns a directory to it and 
+ *			unlocks its dedicated condition variable which was used to `cnd_wait`.
  * @ret:	VOID
  * @errors:	NONE */
 void sync_dequeue(queue_entry_t *thread_entry);
@@ -168,7 +172,7 @@ void sync_dequeue(queue_entry_t *thread_entry);
  *			it turns out that the work is done,	it will update the <threads_finished>
  *			global variable to <true> and release all of the sleeping threads (through
  *			reaping through <waiting_threads_queue>'s entries' condition variables).
- * @ret:	true <-> (<threads_finished> == true) || (is_finished() == true)
+ * @ret:	true <-> (<no threads are working> == true) || (<dir_queue> is empty)
  * @errors:	NONE */
 bool check_to_terminate(void);
 /*************************************************************************/
@@ -249,8 +253,8 @@ void enqueue(queue_t *queue, queue_entry_t *entry);
  * @errors:	NONE */
 void dequeue(queue_t *queue, queue_entry_t **entry);
 
-/* @action:	accepts abstract path to directory <path>, a dirent's name <dirent_name>,
- *			and a pointer to a string that we will store the conjoined path into.
+/* @action:	accepts abstract path to directory <dir_path>, a dirent's name <dirent_name>,
+ *			and a pointer to a string that we will store the conjoined path into (<dirent_path>)
  * @ret:	VOID
  * @errors:	NONE */
 void append_path(char dir_path[], char dirent_name[], char** dirent_path);
@@ -490,8 +494,6 @@ void dir_enum(DIR *dir, char dir_path[], char pattern[]) {
 
 void handle_dirent(char dir_path[], char dirent_name[], char pattern[]) {
 	struct stat dirent_statbuf; // used to store data induced from `stat`-ing files
-
-	tmp++;
 
 	/* Joining the path of the directory and the <dirent>'s */
 	char* dirent_path;
