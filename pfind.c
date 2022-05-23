@@ -10,8 +10,8 @@
 
 
 /****************************** HIGHLIGHTS: TODO ****************************
-	1. resolve memory issue at line 326
-	2. sid tester is acting up at unsearchable dir test run
+	1. memory issue at line 326 is induced from the fact that sprintf isn't memory-thread-safe (solution? I think not)
+	2. validate all edge cases for stat vs. lstat usage - and what we are expected to act like
 ****************************** HIGHLIGHTS: TODO ****************************/
 
 
@@ -332,7 +332,6 @@ int thrd_reap_directories(void* pattern) {
 			dir_enum(thread_entry->dir_queue_entry->dir, thread_entry->dir_queue_entry->path, (char*) pattern); // thread-safe
 			
 			// free-ing un-used memory of the processed directory entry
-			// if (NULL != thread_entry->dir_queue_entry->path) free(thread_entry->dir_queue_entry->path); // problematic (memory-wise)
 			free(thread_entry->dir_queue_entry); // no more need to the directory queue entry
 			thread_entry->dir_queue_entry = NULL; // nullify the directory fetched to process
 		}
@@ -518,15 +517,17 @@ int handle_new_dir(char *dirent_path) {
 	
 	if ( NULL == (new_dir->dir = opendir(new_dir->path)) ) { // if an error occurred
 	
-		free(dirent_path); // no more use to the dirent_path
 		free(new_dir); // no more use to the new directory's queue entry
 	
-		if (errno != EACCES) { // errors other than no permissions are treated as errors
-			print_err("Error with using the `opendir` command on a new found directory", true, false);
-		} else { // simple permissions denial stdout message
+		if (errno == EACCES) {
 			printf("Directory %s: Permission denied.\n", dirent_path);
-			return -1;
+			free(dirent_path); // no more use to the dirent_path
+		} else { // errors other than no permissions are treated as errors
+			free(dirent_path); // no more use to the dirent_path
+			print_err("Error with using the `opendir` command on a new found directory", true, false);
 		}
+	
+		return -1;
 		
 	} else { // if opendir succeeded, we must have enough permissions to search the directory, so we enqueue it
 		sync_enqueue(new_dir);
@@ -603,7 +604,7 @@ void dequeue(queue_t *queue, queue_entry_t **entry) {
 }
 
 void append_path(char dir_path[], char dirent_name[], char** dirent_path) {
-	unsigned int dirent_path_len = strlen(dir_path) + 1 + strlen(dirent_name) + 1; // 1 for the backslash and another for the null-terminator
+	unsigned int dirent_path_len = strlen(dir_path) + 1 + strlen(dirent_name) + 1; // 1 for the backslash + 1 the null-terminator
 	
 	// allocating memory for the new path
 	*dirent_path = malloc( sizeof(char) * dirent_path_len );
