@@ -11,8 +11,9 @@
 
 /****************************** HIGHLIGHTS: TODO ****************************
 	1. resolve memory issue at line 326
-	2. sid tester is acting up
-	3. sometimes, with a large amount of threads, we miss some files - check this
+	2. synchronize the termination process
+	3. rename some variables
+	4. sid tester is acting up
 ****************************** HIGHLIGHTS: TODO ****************************/
 
 
@@ -33,15 +34,15 @@
 
 /****************************** STRUCTS ****************************/
 typedef struct queue_entry_t {
-	/* responsible for directory entries */
+	/* directory queue entry */
 	char* path;
 	DIR *dir;
 	
-	/* responsible for thread entries */
-	struct queue_entry_t *dir_queue_entry; // the directory it needs to process
-	cnd_t thread_queue_not_empty_event; // the condition variable for a directory being allocated
+	/* thread queue entry */
+	struct queue_entry_t *dir_queue_entry; // the directory that this thread needs to process
+	cnd_t thread_queue_not_empty_event; // the condition variable for a directory being allocated to this thread to work on
 	
-	/* api-required field for FIFO queue */
+	/* api required fields */
 	struct queue_entry_t *next;
 } queue_entry_t;
 
@@ -158,7 +159,7 @@ void sync_enqueue(queue_entry_t *entry);
  *			which are currently awaiting a directory to process 
  * @ret:	VOID
  * @errors:	NONE */
-void sync_dequeue(queue_entry_t *thread_entry);
+void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_queue_entry);
 
 /* @user:	thread-local -> used to check if to terminate the thread or other threads
  * @action:	grabs a lock over the protocol, and checks if another thread has indicated
@@ -209,7 +210,7 @@ void handle_dirent(char dir_path[], char dirent_name[], char pattern[]);
  *			it inserts it into the protocol's FIFO Queue. 
  * @ret: 	success <-> 0
  * @errors:	TERMINATING-ONLY */
-int handle_new_dir(char *dirent_path);
+int handle_new_dir(char dirent_path[]);
 
 /* @user: 	<handle_dirent> -> used to process non-directories passed from <handle_dirent>
  * @action:	accepts the name of a non-directory <dirent>, its full path, and <pattern>.
@@ -233,18 +234,18 @@ bool is_finished(void);
 /****************************** REGULAR AUXILIARY FUNCTIONS ********************************/
 /******************************************************************************************/
 /* @action:	prints the <error_message> through `perror()`. Also, it may exit the thread/program
- *			according to the arguments <thread_exit> and <main_exit>. In case of a thread exit, 
+ *			according to the arguments <thread_exit> and <program_exit>. In case of a thread exit, 
  *			it updates the amount of working threads (since errors occur in a local thread only upon). 
  * @ret:	VOID
  * @errors:	NONE */
-void print_err(char error_message[], bool thread_exit, bool main_exit);
+void print_err(char error_message[], bool thread_exit, bool program_exit);
 
 /* @action: unsynchronized enqueue of <entry> into <queue>
  * @ret:	VOID
  * @errors:	NONE */
 void enqueue(queue_t *queue, queue_entry_t *entry);
 
-/* @action: unsynchronized dequeue from the FIFO queue <queueu> to <entry>
+/* @action: unsynchronized dequeue from <queue> to <entry>
  * @ret:	VOID
  * @errors:	NONE */
 void dequeue(queue_t *queue, queue_entry_t **entry);
@@ -253,7 +254,7 @@ void dequeue(queue_t *queue, queue_entry_t **entry);
  *			and a pointer to a string that we will store the conjoined path into.
  * @ret:	VOID
  * @errors:	NONE */
-void append_path(char dir_path[], char dirent_name[], char** dirent_path);
+void append_path(char dir_path[], char dirent_name[], char* dirent_path[]);
 /******************************************************************************************/
 
 
@@ -311,11 +312,11 @@ int atomic_join_threads(unsigned int num_threads, thrd_t thread_ids[]) {
 }
 
 int thrd_reap_directories(void* pattern) {
-
+	queue_entry_t *curr_dir_entry;
+	
 	/* creating a dedicated condition variable for this thread to use to be woken up for work with */
-	queue_entry_t *thread_entry;
-	thread_entry = malloc(sizeof(queue_entry_t));
-	cnd_init(&thread_entry->thread_queue_not_empty_event);
+	queue_entry_t thread_queue_entry;
+	cnd_init(&thread_queue_entry.thread_queue_not_empty_event);
 	
 	/* block the thread code until we are able to start working */
 	start_fence();
@@ -323,18 +324,16 @@ int thrd_reap_directories(void* pattern) {
 	/* Start working */
 	while (true) {
 		// thread-safe dequeue-ing of a directory from the protocol's FIFO Queue
-		sync_dequeue(thread_entry);
+		sync_dequeue(&curr_dir_entry, &thread_queue_entry);
 		
 		// handling of the directory we have just dequeued
-		if (NULL != thread_entry->dir_queue_entry) { // avoiding dequeue-ing of an empty queue
-			// enumerate new deququed directory
-			dir_enum(thread_entry->dir_queue_entry->dir, thread_entry->dir_queue_entry->path, (char*) pattern); // thread-safe
+		if (NULL != curr_dir_entry) { // avoiding dequeue-ing of an empty queue
+			dir_enum(curr_dir_entry->dir, curr_dir_entry->path, (char*) pattern); // thread-safe
+			working_threads--;
 			
-			
-			// free-ing un-used memory of the processed directory entry
-			// if (NULL != thread_entry->dir_queue_entry->path) free(thread_entry->dir_queue_entry->path); // problematic (memory-wise)
-			free(thread_entry->dir_queue_entry); // no more need to the directory queue entry
-			thread_entry->dir_queue_entry = NULL; // nullify the directory fetched to process
+			// free-ing un-used memory
+			// if (NULL != curr_dir_entry->path) free(curr_dir_entry->path); // problematic (memory-wise)
+			// free(curr_dir_entry); // no more need to the directory queue entry
 		}
 		
 		// checking if we need to terminate the reaping of this thread or other threads'
@@ -342,7 +341,7 @@ int thrd_reap_directories(void* pattern) {
 	}
 	
 	/* destroy the thread-specific lock and exit */
-	cnd_destroy(&thread_entry->thread_queue_not_empty_event);
+	cnd_destroy(&thread_queue_entry.thread_queue_not_empty_event);
 	thrd_exit(1); 
 }
 /****************************************************************************************/
@@ -393,49 +392,55 @@ void start_fence(void) {
 
 /**************************************** PROTOCOL'S API *************************************/
 void sync_enqueue(queue_entry_t *dir_queue_entry) {
-	queue_entry_t *thread_entry;
+	queue_entry_t *thread_queue_entry;
 	
 	/* Synchronization block start */
 	mtx_lock(&protocol_lock);
 	
 	// dequeue the first thread who went to sleep
-	dequeue(&waiting_threads_queue, &thread_entry);
+	dequeue(&waiting_threads_queue, &thread_queue_entry);
 	
-	if (NULL == thread_entry) { // if no threads are sleeping, simply enqueue the new directory to the <dir_queue>
+	if (NULL == thread_queue_entry) { // if no threads are sleeping, simply enqueue the new directory to the <dir_queue>
 		enqueue(&dir_queue, dir_queue_entry);
 		
 	} else { // if there are sleeping threads, we must serve the currently enqueuq-ed directory to the first sleeping thread
-		thread_entry->dir_queue_entry = dir_queue_entry; // attaching the new enqueued directory to the very first sleeping thread
-		cnd_signal(&thread_entry->thread_queue_not_empty_event); // waking the very first sleeping thread of the queue
+		thread_queue_entry->dir_queue_entry = dir_queue_entry; // attaching the new enqueued directory to the very first sleeping thread
+		cnd_signal(&thread_queue_entry->thread_queue_not_empty_event); // waking the very first sleeping thread of the queue
+		working_threads++;
 	}
 	
 	mtx_unlock(&protocol_lock);
 	/* Synchronization block end */
+	
+	
 }
 
-void sync_dequeue(queue_entry_t *thread_entry) {
+void sync_dequeue(queue_entry_t **entry, queue_entry_t *thread_queue_entry) {
 	
 	/* Synchronization block start */
 	mtx_lock(&protocol_lock);
 	
-	// find a directory to process
-	if ( dir_queue.size == 0 && !threads_finished ) { // if there are no directories left to process, go to sleep 
-		// adding this thread to the waiting list
-		waiting_threads++;
-		enqueue(&waiting_threads_queue, thread_entry);
-		
-		// wait for an enqueuer to wake you up with a task
-		printf("sleeping: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
-		cnd_wait(&thread_entry->thread_queue_not_empty_event, &protocol_lock);
-		printf("awakening: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
-		waiting_threads--;
-		
-	} else { // if there are directories to process, remove first directory at <dir_queue>
-		dequeue(&dir_queue, &thread_entry->dir_queue_entry);
+	// if there are directories to process, remove first directory at <dir_queue>
+	if ( dir_queue.size == 0 && !threads  { 
+		dequeue(&dir_queue, thread_queue_entry->dir_queue_entry);
+		if (*entry != NULL) {
+			working_threads++;
+		}
 	}
 	
-	// if there was a directory that was dequeue-ed, this thread is considered working from now on, so we increment <working_threads>
-	if (thread_entry->dir_queue_entry != NULL) working_threads++; 
+	// if there are no directories left to process, go to sleep
+	while ( dir_queue.size == 0 && !threads_finished ) {  
+		// adding this thread to the waiting list
+		waiting_threads++;
+		enqueue(&waiting_threads_queue, thread_queue_entry);
+		
+		// wait for an enqueuer to wake you up with a task
+		cnd_wait(&thread_queue_entry->thread_queue_not_empty_event, &protocol_lock);
+		if (thread_queue_entry->dir_queue_entry != NULL) break;
+	} 
+	*entry = thread_queue_entry->dir_queue_entry;
+	waiting_threads--;
+	
 	
 	printf("processing: %lu, working: %u, waiting: %u, tasks: %u\n", thrd_current(), working_threads, waiting_threads_queue.size, dir_queue.size);
 	/* Synchronization block end */
@@ -444,9 +449,6 @@ void sync_dequeue(queue_entry_t *thread_entry) {
 
 bool check_to_terminate(void) {
 	mtx_lock(&protocol_lock);
-	
-	// after enumerating the directory, we had done working, so we decrease this global variable (which was incremented at sync_dequeue)
-	if (working_threads > 0) working_threads--;
 	
 	if (threads_finished) { // if a thread has already indicated to everyone that the work is done
 		mtx_unlock(&protocol_lock);
@@ -509,15 +511,15 @@ void handle_dirent(char dir_path[], char dirent_name[], char pattern[]) {
 	}
 }
 
-int handle_new_dir(char *dirent_path) {
+int handle_new_dir(char dirent_path[]) {
 	queue_entry_t *new_dir;
-	new_dir = (queue_entry_t*) calloc(1, sizeof(queue_entry_t));
+	new_dir = malloc(sizeof(queue_entry_t));
 	new_dir->path = dirent_path;
 	
 	if ( NULL == (new_dir->dir = opendir(new_dir->path)) ) { // if an error occurred
 	
-		free(dirent_path); // no more use to the dirent_path
-		free(new_dir); // no more use to the new directory's queue entry
+		// free(dirent_path); // no more use to the dirent_path
+		// free(new_dir); // no more use to the new directory's queue entry
 	
 		if (errno != EACCES) { // errors other than no permissions are treated as errors
 			print_err("Error with using the `opendir` command on a new found directory", true, false);
@@ -538,7 +540,7 @@ void handle_new_file(char dirent_name[], char dirent_path[], char pattern[]) {
 	if (NULL != strstr(dirent_name, pattern)) { // if <pattern> is in <dirent_name>
 		pattern_matches++;
 		printf("%s\n", dirent_path);
-		free(dirent_path); // no more use to the dirent_path
+		// free(dirent_path); // no more use to the dirent_path
 	}
 }
 
@@ -558,13 +560,14 @@ bool is_finished(void) {
 
 
 /****************************** REGULAR AUXILIARY FUNCTIONS ********************************/
-void print_err(char error_message[], bool thread_exit, bool main_exit) {
+void print_err(char error_message[], bool thread_exit, bool program_exit) {
 	int tmp_errno = errno;
 	perror(error_message); // this basically prints error_message, with <strerror(errno)> appended to it */
 	errno = tmp_errno;
 	
 	if (thread_exit) {	
 		mtx_lock(&protocol_lock);
+		working_threads--; // this function is called only from within the <dir_enum> function which is considered working
 		// check if there is need to terminate the program after exiting this thread
 		check_to_terminate();
 		mtx_unlock(&protocol_lock);
@@ -572,7 +575,7 @@ void print_err(char error_message[], bool thread_exit, bool main_exit) {
 		thrd_exit(1); // exiting the thread
 	}
 	
-	if (main_exit) {
+	if (program_exit) {
 		exit(1);
 	}
 }
@@ -593,11 +596,11 @@ void dequeue(queue_t *queue, queue_entry_t **entry) {
 	}
 }
 
-void append_path(char dir_path[], char dirent_name[], char** dirent_path) {
-	unsigned int dirent_path_len = strlen(dir_path) + 1 + strlen(dirent_name) + 1; // 1 for the backslash and another for the null-terminator
+void append_path(char dir_path[], char dirent_name[], char* dirent_path[]) {
+	unsigned int dirent_path_len = strlen(dir_path) + strlen(dirent_name) + 2;
 	
 	// allocating memory for the new path
-	*dirent_path = malloc( sizeof(char) * dirent_path_len );
+	*dirent_path = (char*) malloc( sizeof(char) * dirent_path_len );
 	if (NULL == *dirent_path) print_err("Thread: Couldn't allocate memory", true, false); 
 	
 	// building the new path
