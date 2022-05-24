@@ -317,7 +317,9 @@ int atomic_join_threads(unsigned int num_threads, thrd_t thread_ids[]) {
 
 int thrd_reap_directories(void* pattern) {
 
-	/* creating a dedicated condition variable for this thread to use to be woken up for work with */
+	/* creating a dedicated condition variable for this thread to use to be woken up for work with.
+	 * This function guarantees that as long as the thread is not working (hasn't been allocated
+	 * a directory to search at), thread_entry->dir_queue_entry will be equal to NULL */
 	queue_entry_t *thread_entry;
 	thread_entry = malloc(sizeof(queue_entry_t));
 	thread_entry->dir_queue_entry = NULL;
