@@ -10,8 +10,9 @@
 
 
 /****************************** HIGHLIGHTS: TODO ****************************
-	1. memory issue at line 326 is induced from the fact that sprintf isn't memory-thread-safe (solution? I think not)
-	2. validate all edge cases for stat vs. lstat usage - and what we are expected to act like
+	1. memory issue at line 326 is induced from the fact that sprintf isn't memory-thread-safe.
+	There isn't a solution besides leaving it alone - that's the life of multi-threading and the
+	very bad memory model usage of <threads.h>.
 ****************************** HIGHLIGHTS: TODO ****************************/
 
 
@@ -423,7 +424,7 @@ void sync_dequeue(queue_entry_t *thread_entry) {
 	
 	
 	if ( !threads_finished ) { // if there is more work to do, find a directory to process
-		if ( dir_queue.size != 0 ) { // if there are directories available process, remove first directory at <dir_queue>
+		if ( dir_queue.size > 0 ) { // if there are directories available process, remove first directory at <dir_queue>
 			dequeue(&dir_queue, &thread_entry->dir_queue_entry);
 			working_threads++; // we have a directory to enumerate, hence this thread is working
 		} else { // if there are no directories currently available to process, go to sleep
@@ -489,7 +490,7 @@ void dir_enum(DIR *dir, char dir_path[], char pattern[]) {
 	}	
 	
 	// close the open dirent after use to free up the fd table
-	if (0 != closedir(dir)) print_err("Thread: Couldn't close an open dirent", true, false);
+	if (0 != closedir(dir)) print_err("Thread Error: Couldn't close an open directory", true, false);
 }
 
 void handle_dirent(char dir_path[], char dirent_name[], char pattern[]) {
@@ -500,15 +501,19 @@ void handle_dirent(char dir_path[], char dirent_name[], char pattern[]) {
 	append_path(dir_path, dirent_name, &dirent_path);
 	
 	/* Getting the file type of the dirent */
-	if (0 != lstat(dirent_path, &dirent_statbuf)) { // TODO: change to stat
-		print_err("Error with `stat`-ing a dirent", true, false);
+	if (0 != stat(dirent_path, &dirent_statbuf)) { // TODO: change to stat
+		if (errno != ENOENT) {
+			print_err("Thread Error: Couldn't `stat` a `dirent`", true, false);
+		} else { // errno == `ENOENT` means that this is a symbolic link -> which doesn't point to a directory
+			dirent_statbuf.st_mode = 0; // forces the following handling to recognize this as a non-directory
+		}
 	}
 	
 	/* handle new entry */
 	if (S_ISDIR(dirent_statbuf.st_mode)) { //If the entry points to a directory
-		handle_new_dir(dirent_path); // handles the dirent_full_path memory
+		handle_new_dir(dirent_path);
 	} else { // If the entry doesn't point to a directory
-		handle_new_file(dirent_name, dirent_path, pattern); // handles the dirent_full_path memory
+		handle_new_file(dirent_name, dirent_path, pattern);
 	}
 }
 
@@ -526,7 +531,7 @@ int handle_new_dir(char *dirent_path) {
 			free(dirent_path); // no more use to the dirent_path
 		} else { // errors other than no permissions are treated as errors
 			free(dirent_path); // no more use to the dirent_path
-			print_err("Error with using the `opendir` command on a new found directory", true, false);
+			print_err("Thread Error: Couldn't `opendir` a directory", true, false);
 		}
 	
 		return -1;
@@ -610,7 +615,7 @@ void append_path(char dir_path[], char dirent_name[], char** dirent_path) {
 	
 	// allocating memory for the new path
 	*dirent_path = malloc( sizeof(char) * dirent_path_len );
-	if (NULL == *dirent_path) print_err("Thread: Couldn't allocate memory", true, false); 
+	if (NULL == *dirent_path) print_err("Thread Error: Couldn't allocate memory", true, false); 
 	
 	// building the new path
 	sprintf(*dirent_path, "%s/%s", dir_path, dirent_name); // buffer-overflow vulnerability
@@ -652,13 +657,13 @@ int main(int args, char* argv[]) {
 	root_dir->path = root_dir_path;
 	root_dir->next = NULL;
 	if ( NULL == (root_dir->dir = opendir(root_dir->path)) ) {
-		print_err("Main Thread: Couldn't open root directory", false, true);
+		print_err("Main Thread Error: Couldn't open root directory", false, true);
 	}
 	enqueue(&dir_queue, root_dir);
 	
 	// create all threads and wait for all of them to be created
 	if ( 0 > atomic_create_threads(num_threads, thread_ids, pattern) ) {
-		print_err("Main Thread: Couldn't create a thread", false, true);
+		print_err("Main Thread Error: Couldn't create a thread", false, true);
 	}
 	
 	// signal the threads to start working
@@ -666,7 +671,7 @@ int main(int args, char* argv[]) {
 	cnd_broadcast(&threads_start_event);
 	
 	// wait for all threads to be finish working (if all are waiting, one of the searching threads will terminate the whole program)
-	if (0 != atomic_join_threads(num_threads, thread_ids)) print_err("Main Thread: Couldn't join a thread", false, false);
+	if (0 != atomic_join_threads(num_threads, thread_ids)) print_err("Main Thread Error: Couldn't join a thread", false, false);
 	
 	// destroying locks and condition variables
 	destroy_peripherals();
