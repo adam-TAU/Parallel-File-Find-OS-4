@@ -9,11 +9,11 @@
 
 
 
-/****************************** HIGHLIGHTS: TODO ****************************
+/****************************** HIGHLIGHTS ****************************
 	1. memory issue at line 326 is induced from the fact that sprintf isn't memory-thread-safe.
 	There isn't a solution besides leaving it alone - that's the life of multi-threading and the
 	very bad memory model usage of <threads.h>.
-****************************** HIGHLIGHTS: TODO ****************************/
+****************************** HIGHLIGHTS ****************************/
 
 
 #include <stdio.h>
@@ -501,7 +501,7 @@ void handle_dirent(char dir_path[], char dirent_name[], char pattern[]) {
 	append_path(dir_path, dirent_name, &dirent_path);
 	
 	/* Getting the file type of the dirent */
-	if (0 != stat(dirent_path, &dirent_statbuf)) { // TODO: change to stat
+	if (0 != stat(dirent_path, &dirent_statbuf)) {
 		if (errno != ENOENT) {
 			print_err("Thread Error: Couldn't `stat` a `dirent`", true, false);
 		} else { // errno == `ENOENT` means that this is a symbolic link -> which doesn't point to a directory
